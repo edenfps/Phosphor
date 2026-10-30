@@ -1,0 +1,13 @@
+# Build output
+build/
+bin/
+
+# Runtime files
+*.log
+dump.png
+dump.flag
+
+# Editors
+.vs/
+.vscode/
+*.user
