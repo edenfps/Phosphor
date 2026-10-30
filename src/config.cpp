@@ -156,6 +156,7 @@ bool LoadConfig(const std::wstring& path, Config& cfg)
             else if (k == L"subpixel_layout") c.subpixelLayout = _wtoi(v.c_str());
             else if (k == L"auto_resolution") c.autoResolution = Lower(v) == L"on" || v == L"1";
             else if (k == L"detect_debug") c.detectDebug = Lower(v) == L"on" || v == L"1";
+            else if (k == L"menu_key") c.menuKey = v;
             else if (k == L"motion") c.motion = Lower(v) == L"on" || v == L"1";
             else if (k == L"crt_hz") c.crtHz = (float)_wtof(v.c_str());
             else if (k == L"motion_gain") c.motionGain = (float)_wtof(v.c_str());

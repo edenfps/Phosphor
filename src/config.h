@@ -57,8 +57,9 @@ struct Config
     float peakNits = 0;          // 0 = from display
     int sdrOutput = 0;           // SDR desktop: 0 sRGB panel, 1 gamma 2.2 panel
     int subpixelLayout = 0;      // index into the panel layout table (main.cpp), 0 = off
-    bool autoResolution = true;
-    bool detectDebug = false;    // log every resolution analysis  // detect stretched lower-res content and redraw it at its real resolution
+    bool autoResolution = false; // detect stretched lower-res content and redraw it at its real resolution
+    bool detectDebug = false;    // log every resolution analysis
+    std::wstring menuKey = L"Insert"; // opens the toggles menu
     // Rolling scan (CRT motion clarity)
     bool motion = false;         // start with it on
     float crtHz = 80.0f;         // virtual CRT refresh; panel Hz / crtHz refreshes per field

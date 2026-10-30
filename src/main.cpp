@@ -19,8 +19,9 @@
 
 namespace
 {
-enum { HK_TOGGLE = 1, HK_SPLIT, HK_PRESET, HK_RELOAD, HK_QUIT, HK_BEAM, HK_LAYOUT, HK_MOTION, HK_DEBLUR, HK_VECTORS, HK_CHARACTER, HK_AUTORES };
-enum { ID_ENABLE = 100, ID_SPLIT, ID_RELOAD, ID_OPENCFG, ID_EXIT, ID_PRESET0 = 200 };
+enum { HK_TOGGLE = 1, HK_SPLIT, HK_PRESET, HK_RELOAD, HK_QUIT, HK_BEAM, HK_LAYOUT, HK_MOTION, HK_DEBLUR, HK_VECTORS, HK_CHARACTER, HK_AUTORES, HK_MENU };
+enum { ID_ENABLE = 100, ID_SPLIT, ID_RELOAD, ID_OPENCFG, ID_EXIT, ID_AUTORES, ID_MOTION, ID_CHARACTER,
+       ID_PRESET0 = 200, ID_BEAM0 = 300, ID_LAYOUT0 = 400 };
 const UINT WM_TRAY = WM_APP + 1;
 
 struct App
@@ -53,6 +54,7 @@ struct App
     bool characterOff = false; // A/B: veiling glow + analog softness forced off
     // Automatic resolution detection
     int autoRes = -1;          // override: -1 = from config
+    UINT menuVk = 0;           // registered menu key
     int autoW = 0, autoH = 0;  // detected source size, 0 = native
     DWORD lastProbe = 0;
     bool framesSinceProbe = false;
@@ -71,6 +73,7 @@ struct App
 } g;
 
 void ShowOsd(DWORD ms = 6000);
+void RegisterMenuKey();
 
 bool MotionOn() { return g.motion >= 0 ? g.motion != 0 : g.cfg.motion; }
 bool AutoResOn() { return g.autoRes >= 0 ? g.autoRes != 0 : g.cfg.autoResolution; }
@@ -596,7 +599,8 @@ void RebuildOsd()
         else
             body += L"\nMotion pre-deblur: off. Press D to try it.";
 #endif
-        std::wstring keys = L"Ctrl+Alt+Shift +     A  auto resolution      M  CRT motion      B  beam      L  fringe fix      "
+        std::wstring keys = (g.menuVk ? g.cfg.menuKey + L"  all toggles      " : std::wstring()) +
+                            L"Ctrl+Alt+Shift +     A  auto resolution      M  CRT motion      B  beam      "
                             L"P  next look      S  split      C  on/off      Q  quit";
         std::wstring hdr = g.disp.hdr ? L""
                                       : L"Windows HDR is off, so highlight glow and bright scanlines are limited. "
@@ -801,37 +805,133 @@ void ReloadAll()
     g.shaderStamp = FileStamp(g.shaderPath);
     if (g.dev)
         g.renderer.Reload();
+    RegisterMenuKey();
     UpdateTrayTip();
     ShowOsd();
 }
 
-void ShowTrayMenu()
+// Toggles menu: every switch in one place, current state checked. Opened by
+// the menu key (Insert by default) at the centre of the screen, or from the
+// tray icon at the cursor.
+void ShowToggleMenu(bool atCursor)
 {
+    auto Flag = [](bool on) { return UINT(MF_STRING | (on ? MF_CHECKED : 0)); };
     HMENU m = CreatePopupMenu();
-    HMENU pm = CreatePopupMenu();
+
+    HMENU looks = CreatePopupMenu();
     for (size_t i = 0; i < g.cfg.presets.size(); i++)
-        AppendMenuW(pm, MF_STRING | (int(i) == g.cfg.presetIndex ? MF_CHECKED : 0), ID_PRESET0 + i,
-                    g.cfg.presets[i].name.c_str());
-    AppendMenuW(m, MF_STRING | (g.enabled ? MF_CHECKED : 0), ID_ENABLE, L"Enabled\tCtrl+Alt+Shift+C");
-    AppendMenuW(m, MF_STRING | (g.split > 0 ? MF_CHECKED : 0), ID_SPLIT, L"A/B split compare\tCtrl+Alt+Shift+S");
-    AppendMenuW(m, MF_POPUP, (UINT_PTR)pm, L"Preset\tCtrl+Alt+Shift+P");
+        AppendMenuW(looks, Flag(int(i) == g.cfg.presetIndex), ID_PRESET0 + i, g.cfg.presets[i].name.c_str());
+    HMENU beams = CreatePopupMenu();
+    for (int i = 0; i < int(_countof(kBeamLevels)); i++)
+        AppendMenuW(beams, Flag(i == g.beamLevel), ID_BEAM0 + i, kBeamLevels[i].name);
+    HMENU layouts = CreatePopupMenu();
+    for (int i = 0; i < int(_countof(kLayouts)); i++)
+    {
+        std::wstring name = std::to_wstring(i) + L": " + kLayouts[i].name;
+        AppendMenuW(layouts, Flag(i == CurrentLayout()), ID_LAYOUT0 + i, name.c_str());
+    }
+
+    AppendMenuW(m, Flag(g.enabled), ID_ENABLE, L"Phosphor on\tCtrl+Alt+Shift+C");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)looks, L"Look\tCtrl+Alt+Shift+P");
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)beams, L"Beam sharpness\tCtrl+Alt+Shift+B");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, Flag(AutoResOn()), ID_AUTORES, L"Auto resolution detection\tCtrl+Alt+Shift+A");
+    AppendMenuW(m, Flag(MotionOn()), ID_MOTION, L"CRT motion (experimental)\tCtrl+Alt+Shift+M");
+    AppendMenuW(m, Flag(g.split > 0), ID_SPLIT, L"Split compare (raw | Phosphor)\tCtrl+Alt+Shift+S");
+    AppendMenuW(m, Flag(!g.characterOff), ID_CHARACTER, L"Glass veil + analog softness\tCtrl+Alt+Shift+G");
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)layouts, L"Colour fringe fix\tCtrl+Alt+Shift+L");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, ID_OPENCFG, L"Edit config...");
     AppendMenuW(m, MF_STRING, ID_RELOAD, L"Reload config + shader\tCtrl+Alt+Shift+R");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(m, MF_STRING, ID_EXIT, L"Exit\tCtrl+Alt+Shift+Q");
+    AppendMenuW(m, MF_STRING, ID_EXIT, L"Quit Phosphor\tCtrl+Alt+Shift+Q");
+
     POINT pt;
-    GetCursorPos(&pt);
+    UINT align = TPM_RIGHTBUTTON;
+    if (atCursor)
+        GetCursorPos(&pt);
+    else
+    {
+        pt = {(g.disp.rect.left + g.disp.rect.right) / 2, (g.disp.rect.top + g.disp.rect.bottom) / 2};
+        align |= TPM_CENTERALIGN | TPM_VCENTERALIGN;
+    }
     SetForegroundWindow(g.ctrl);
-    TrackPopupMenu(m, TPM_RIGHTBUTTON, pt.x, pt.y, 0, g.ctrl, nullptr);
+    TrackPopupMenu(m, align, pt.x, pt.y, 0, g.ctrl, nullptr);
     PostMessageW(g.ctrl, WM_NULL, 0, 0);
-    DestroyMenu(m);
+    DestroyMenu(m); // also destroys the submenus
+}
+
+UINT MenuVirtualKey(const std::wstring& name);
+
+// (Re)claim the menu key; it's a plain key, so other apps stop receiving it.
+void RegisterMenuKey()
+{
+    UINT vk = MenuVirtualKey(g.cfg.menuKey);
+    if (vk == g.menuVk || !g.ctrl)
+        return;
+    if (g.menuVk)
+        UnregisterHotKey(g.ctrl, HK_MENU);
+    g.menuVk = 0;
+    if (vk && RegisterHotKey(g.ctrl, HK_MENU, MOD_NOREPEAT, vk))
+        g.menuVk = vk;
+    else if (vk)
+        Log(L"warning: menu key '%s' is taken by another app", g.cfg.menuKey.c_str());
+}
+
+// Virtual-key code for the menu_key setting.
+UINT MenuVirtualKey(const std::wstring& name)
+{
+    std::wstring n = name;
+    std::transform(n.begin(), n.end(), n.begin(), ::towlower);
+    static const std::pair<const wchar_t*, UINT> keys[] = {
+        {L"insert", VK_INSERT}, {L"home", VK_HOME},   {L"end", VK_END},         {L"pageup", VK_PRIOR},
+        {L"pagedown", VK_NEXT}, {L"pause", VK_PAUSE}, {L"scrolllock", VK_SCROLL}};
+    for (auto& k : keys)
+        if (n == k.first)
+            return k.second;
+    if (n.size() >= 2 && n[0] == L'f')
+    {
+        int f = _wtoi(n.c_str() + 1);
+        if (f >= 1 && f <= 24)
+            return VK_F1 + f - 1;
+    }
+    return 0;
 }
 
 void Command(UINT id)
 {
     if (id == ID_ENABLE)
         SetEnabled(!g.enabled);
+    else if (id == ID_AUTORES)
+    {
+        g.autoRes = AutoResOn() ? 0 : 1;
+        if (!g.autoRes)
+            g.autoW = g.autoH = 0;
+        g.dirty = true;
+        ShowOsd();
+    }
+    else if (id == ID_MOTION)
+    {
+        g.motion = MotionOn() ? 0 : 1;
+        g.lastField = -1;
+        ShowOsd();
+    }
+    else if (id == ID_CHARACTER)
+    {
+        g.characterOff = !g.characterOff;
+        ShowOsd();
+    }
+    else if (id >= ID_BEAM0 && id < ID_BEAM0 + _countof(kBeamLevels))
+    {
+        g.beamLevel = int(id - ID_BEAM0);
+        ShowOsd();
+    }
+    else if (id >= ID_LAYOUT0 && id < ID_LAYOUT0 + _countof(kLayouts))
+    {
+        g.layout = int(id - ID_LAYOUT0);
+        ShowOsd(6000);
+    }
     else if (id == ID_SPLIT)
     {
         g.split = g.split > 0 ? 0.0f : 0.5f;
@@ -884,6 +984,9 @@ LRESULT CALLBACK CtrlProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             g.vectors = !g.vectors;
             g.dirty = true;
             break;
+        case HK_MENU:
+            ShowToggleMenu(false);
+            break;
         case HK_AUTORES:
             g.autoRes = AutoResOn() ? 0 : 1;
             if (!g.autoRes)
@@ -911,7 +1014,7 @@ LRESULT CALLBACK CtrlProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     case WM_TRAY:
         if (LOWORD(lp) == WM_RBUTTONUP || LOWORD(lp) == WM_LBUTTONUP)
-            ShowTrayMenu();
+            ShowToggleMenu(true);
         return 0;
     case WM_COMMAND:
         Command(LOWORD(wp));
@@ -960,6 +1063,7 @@ int RunOverlay(HINSTANCE inst)
     RegisterHotKey(g.ctrl, HK_MOTION, mods, 'M');
     RegisterHotKey(g.ctrl, HK_CHARACTER, mods, 'G');
     RegisterHotKey(g.ctrl, HK_AUTORES, mods, 'A');
+    RegisterMenuKey();
 #if PHOSPHOR_DEBLUR
     RegisterHotKey(g.ctrl, HK_DEBLUR, mods, 'D');
     RegisterHotKey(g.ctrl, HK_VECTORS, mods, 'V');

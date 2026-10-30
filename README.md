@@ -47,7 +47,7 @@ errors, convergence errors and dimming are left out.
 | **Tube response** | A pure power-law gamma (2.4 by default) with true black, Diamondtron / Trinitron / P22 phosphor primaries, and a 6500 K or 9300 K white point. |
 | **Physical units** | Beam, glow and halation are specified in **millimetres on the glass** and converted using the panel size read from EDID. The look matches a real tube at the same viewing distance on any monitor. |
 | **Any resolution, cleanly** | Lower-resolution content is redrawn as real scanlines at its true resolution instead of being blurrily upscaled. That's how a CRT shows 1080p, 720p or 240p. |
-| **Auto resolution detection** | Detects when fullscreen video or a game was stretched from a lower resolution, and switches to it automatically. See [below](#auto-resolution-detection). |
+| **Auto resolution detection** | Optional. Detects when fullscreen video or a game was stretched from a lower resolution, and switches to it automatically. See [below](#auto-resolution-detection). |
 | **HDR aware** | Highlight punch (small bright areas go above full-field white, like a CRT whose ABL only limits large areas), scRGB output, and dithering in the panel's own PQ signal so dark gradients stay smooth. |
 | **QD-OLED fringe fix** | Each colour is drawn at its emitter's physical position inside the pixel, calibrated by eye, to cancel the red/green fringing of triangular subpixel layouts. |
 | **On-screen help** | Every hotkey shows a panel saying what changed and what to look for. A split view compares the raw OLED with Phosphor side by side. |
@@ -88,7 +88,11 @@ folder, so you can edit them live while it runs.
 
 ## Hotkeys
 
-All hotkeys are **Ctrl + Alt + Shift +** a key:
+Press **Insert** for a menu with every toggle (look, beam, auto resolution, CRT motion, split
+compare, fringe fix, reload, quit). The key is configurable with `menu_key`; while Phosphor runs, other
+apps don't receive it.
+
+Direct hotkeys are **Ctrl + Alt + Shift +** a key:
 
 | Key | Action |
 |---|---|
@@ -103,7 +107,7 @@ All hotkeys are **Ctrl + Alt + Shift +** a key:
 | **G** | A/B the glass veil + analog softness |
 | **R** | Reload config + shader |
 
-The tray icon has the same functions plus a look menu.
+Right-clicking the tray icon opens the same toggles menu.
 
 ## Looks
 
@@ -131,6 +135,7 @@ because the grids no longer line up. Native content shows a smoothly rising erro
 so it is left alone.
 
 The decision only switches after three identical results in a row, and falls back to native when unsure.
+It's **off by default**. Turn it on from the Insert menu, with Ctrl+Alt+Shift+A, or with `auto_resolution = on`.
 
 - **Works with:** fullscreen browser video and games stretched with standard scalers, from 1440p down to 240p.
 - **Stays native on purpose:** DLSS, FSR and TAA upscaling rebuild real detail and have no fixed-kernel
