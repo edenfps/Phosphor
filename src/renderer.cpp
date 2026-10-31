@@ -15,7 +15,7 @@ struct FrameCB
     float inputMode, sdrWhiteScale, crtGamma, outputMode;
     float spotMinPx, spotMaxPx, spotPower, spotAspect;
     float spotTail, tailMix, aaX, aaY;
-    float radiusH, radiusV, pad1, pad2;
+    float radiusH, radiusV, srcOffX, srcOffY;
     float diffusion, halation, nearMix, haloRings;
     float maskType, maskStrength, maskPitch, brightness;
     float peak, split, highlightBoost, aplKnee;
@@ -162,13 +162,14 @@ int HaloKernel(float glassPx, float out[32][4])
     return K;
 }
 
-ComPtr<ID3DBlob> Compile(const std::string& src, const std::wstring& path, const char* entry, const char* target)
+ComPtr<ID3DBlob> Compile(const std::string& src, const std::wstring& path, const char* entry, const char* target,
+                         const D3D_SHADER_MACRO* defines = nullptr)
 {
     ComPtr<ID3DBlob> code, err;
     std::string name;
     for (wchar_t c : path)
         name += char(c < 128 ? c : '?');
-    HRESULT hr = D3DCompile(src.data(), src.size(), name.c_str(), nullptr, nullptr, entry, target,
+    HRESULT hr = D3DCompile(src.data(), src.size(), name.c_str(), defines, nullptr, entry, target,
                             D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &err);
     if (FAILED(hr))
     {
@@ -180,6 +181,10 @@ ComPtr<ID3DBlob> Compile(const std::string& src, const std::wstring& path, const
     return code;
 }
 } // namespace
+
+// Rows per compute tile of the fused beam (width is 16).
+static int kBeamTileY = 16;
+static const char* kBeamTileYStr = "16";
 
 bool Renderer::Init(ID3D11Device* dev, const std::wstring& shaderPath)
 {
@@ -243,11 +248,53 @@ bool Renderer::Reload()
         if (!b || FAILED(dev_->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &built[i])))
             return false; // keep previous shaders running
     }
+    // Optional: without it the pixel-shader path is used.
+    // One variant per gather radius: the tile apron is sized to it, so a
+    // small spot doesn't pay for loading and decoding a wider border.
+    for (int r = 1; r <= 3; r++)
+    {
+        const char* rs[] = {"1", "2", "3"};
+        const D3D_SHADER_MACRO csDefines[] = {{"PHOSPHOR_CS", "1"}, {"MAXR", rs[r - 1]}, {"TILEY", kBeamTileYStr},
+                                             {nullptr, nullptr}};
+        ComPtr<ID3D11ComputeShader> cs;
+        if (auto cb = Compile(src, shaderPath_, "CS_BeamNative", "cs_5_0", csDefines))
+            dev_->CreateComputeShader(cb->GetBufferPointer(), cb->GetBufferSize(), nullptr, &cs);
+        csBeam_[r - 1] = cs;
+    }
     vs_ = vs;
     for (size_t i = 0; i < _countof(entries); i++)
         *entries[i].dst = built[i];
     Log(L"shader: compiled %s", shaderPath_.c_str());
     return true;
+}
+
+void Renderer::EnsureTubeLut(float gamma)
+{
+    if (tubeLut_ && gamma == tubeLutGamma_)
+        return;
+    // Entry i: linear value x = (i/1023)^2 -> sRGB code value -> code^gamma.
+    std::vector<float> lut(1024);
+    for (int i = 0; i < 1024; i++)
+    {
+        double u = i / 1023.0, x = u * u;
+        double code = x <= 0.0031308 ? x * 12.92 : 1.055 * std::pow(x, 1.0 / 2.4) - 0.055;
+        lut[i] = float(std::pow(code, double(gamma)));
+    }
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width = 1024;
+    td.Height = 1;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_R32_FLOAT;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_IMMUTABLE;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    D3D11_SUBRESOURCE_DATA sd{lut.data(), 1024 * 4, 0};
+    ComPtr<ID3D11Texture2D> tex;
+    tubeLut_.Reset();
+    if (SUCCEEDED(dev_->CreateTexture2D(&td, &sd, &tex)))
+        dev_->CreateShaderResourceView(tex.Get(), nullptr, &tubeLut_);
+    tubeLutGamma_ = gamma;
 }
 
 void Renderer::SetOsd(const uint8_t* rg, UINT w, UINT h)
@@ -283,7 +330,7 @@ bool Renderer::Ensure(Target& t, UINT w, UINT h)
     td.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
     td.SampleDesc.Count = 1;
     td.Usage = D3D11_USAGE_DEFAULT;
-    td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
     if (FAILED(dev_->CreateTexture2D(&td, nullptr, &t.tex)) ||
         FAILED(dev_->CreateRenderTargetView(t.tex.Get(), nullptr, &t.rtv)) ||
         FAILED(dev_->CreateShaderResourceView(t.tex.Get(), nullptr, &t.srv)))
@@ -385,8 +432,27 @@ void Renderer::Render(ID3D11Texture2D* src, ID3D11RenderTargetView* out, UINT w,
     FrameCB cb{};
     cb.srcW = float(sw);
     cb.srcH = float(sh);
-    cb.pitchX = float(w) / sw;
-    cb.pitchY = float(h) / sh;
+    if (L.sourceW >= 1 && L.sourceH >= 1)
+    {
+        // Content keeps its displayed aspect ratio (square pixels unless the
+        // look says otherwise, e.g. 256x224 consoles shown at 4:3), centred with
+        // pillar/letterbox bars; the scanline grid is anchored to it.
+        float aspect = L.sourceAspect > 0 ? L.sourceAspect : float(sw) / sh;
+        float cw = float(w), ch = float(h);
+        if (cw / ch > aspect)
+            cw = ch * aspect;
+        else
+            ch = cw / aspect;
+        cb.pitchX = cw / sw;
+        cb.pitchY = ch / sh;
+        cb.srcOffX = (w - cw) * 0.5f;
+        cb.srcOffY = (h - ch) * 0.5f;
+    }
+    else
+    {
+        cb.pitchX = float(w) / sw;
+        cb.pitchY = float(h) / sh;
+    }
     cb.inputMode = float(fp.inputMode);
     cb.sdrWhiteScale = fp.sdrWhiteScale;
     cb.crtGamma = L.crtGamma;
@@ -417,6 +483,15 @@ void Renderer::Render(ID3D11Texture2D* src, ID3D11RenderTargetView* out, UINT w,
         std::clamp(std::ceil((3.0f * coreH + 0.5f * cb.pitchX + subMaxX) / cb.pitchX), 1.0f, 16.0f);
     float coreV = std::sqrt(cb.spotMaxPx * cb.spotMaxPx + cb.aaY * cb.aaY);
     cb.radiusV = std::clamp(std::ceil((3.0f * coreV + subMaxY) / cb.pitchY + 0.5f), 1.0f, 16.0f);
+    // At native resolution the taps are whole pixels: a tap at distance d is
+    // needed while d <= 3 sigma + half a pixel + the subpixel offset, so the
+    // radius is the floor of that (the general formula above rounds up for
+    // fractional pitches and would add a whole ring of taps here).
+    if (!resample && cb.pitchX == 1.0f && cb.pitchY == 1.0f)
+    {
+        cb.radiusH = std::clamp(std::floor(3.0f * coreH + 0.5f + subMaxX + 1e-3f), 1.0f, 16.0f);
+        cb.radiusV = std::clamp(std::floor(3.0f * coreV + 0.5f + subMaxY + 1e-3f), 1.0f, 16.0f);
+    }
     // The skirt is a wide, current-independent blur: take it from the pyramid.
     float tailLvl = std::clamp(std::log2(std::max(cb.spotMaxPx * std::max(L.spotTailScale, 1.0f), 2.0f)), 1.0f,
                                float(kLevels - 1) - 0.001f);
@@ -457,6 +532,8 @@ void Renderer::Render(ID3D11Texture2D* src, ID3D11RenderTargetView* out, UINT w,
     cb.deblur0[2] = std::max(fp.deblurMaxPx, 1.0f);
     cb.deblur0[3] = deblur ? 1.0f : 0.0f;
 
+    lastRadiusH_ = cb.radiusH;
+    lastRadiusV_ = cb.radiusV;
     D3D11_MAPPED_SUBRESOURCE m;
     if (SUCCEEDED(ctx_->Map(frameCB_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m)))
     {
@@ -490,9 +567,39 @@ void Renderer::Render(ID3D11Texture2D* src, ID3D11RenderTargetView* out, UINT w,
 
     // Stage 0: decode + horizontal beam. Stage 1: vertical beam + glow.
     // Stage 2: final composite. The rolling scan runs one stage per refresh.
-    if (firstStage <= 0)
+    // Native resolution with a small spot: decode + both beam directions in one
+    // compute pass straight into beam_ (no full-screen intermediates).
+    int beamR = int(std::max(cb.radiusH, cb.radiusV));
+    ID3D11ComputeShader* csBeam = beamR >= 1 && beamR <= 3 ? csBeam_[beamR - 1].Get() : nullptr;
+    bool fused = fp.fastPath && csBeam && !resample && cb.pitchX == 1.0f && cb.pitchY == 1.0f;
+    if (fused && firstStage <= 0)
     {
-        Pass(psDecode_.Get(), lin_.rtv.Get(), w, h, {srcSrv_.Get()}, w, h);
+        EnsureTubeLut(L.crtGamma);
+        if (beamUavTex_ != beam_.tex.Get())
+        {
+            beamUav_.Reset();
+            dev_->CreateUnorderedAccessView(beam_.tex.Get(), nullptr, &beamUav_);
+            beamUavTex_ = beam_.tex.Get();
+        }
+        ID3D11ShaderResourceView* none[11] = {};
+        ctx_->PSSetShaderResources(0, 11, none);
+        ctx_->CSSetShader(csBeam, nullptr, 0);
+        ctx_->CSSetConstantBuffers(0, 2, cbs);
+        ctx_->CSSetSamplers(0, 2, samplers);
+        ID3D11ShaderResourceView* in[2] = {srcSrv_.Get(), tubeLut_.Get()};
+        ctx_->CSSetShaderResources(0, 2, in);
+        ctx_->CSSetUnorderedAccessViews(0, 1, beamUav_.GetAddressOf(), nullptr);
+        ctx_->Dispatch((w + 15) / 16, (h + kBeamTileY - 1) / kBeamTileY, 1);
+        ID3D11UnorderedAccessView* noUav = nullptr;
+        ctx_->CSSetUnorderedAccessViews(0, 1, &noUav, nullptr);
+        ID3D11ShaderResourceView* noIn[2] = {};
+        ctx_->CSSetShaderResources(0, 2, noIn);
+        Mark(L"beam (fused)");
+    }
+    if (!fused && firstStage <= 0)
+    {
+        EnsureTubeLut(L.crtGamma);
+        Pass(psDecode_.Get(), lin_.rtv.Get(), w, h, {srcSrv_.Get(), tubeLut_.Get()}, w, h);
         Mark(L"decode");
 
         ID3D11ShaderResourceView* beamSrc = lin_.srv.Get();
@@ -507,7 +614,8 @@ void Renderer::Render(ID3D11Texture2D* src, ID3D11RenderTargetView* out, UINT w,
     }
     if (firstStage <= 1 && lastStage >= 1)
     {
-        Pass(psBeamV_.Get(), beam_.rtv.Get(), w, h, {beamH_.srv.Get()}, w, sh);
+        if (!fused)
+            Pass(psBeamV_.Get(), beam_.rtv.Get(), w, h, {beamH_.srv.Get()}, w, sh);
         Mark(L"beamV");
 
         Target* prev = &beam_;
@@ -568,7 +676,8 @@ void Renderer::Render(ID3D11Texture2D* src, ID3D11RenderTargetView* out, UINT w,
             }
             prevT = t;
         }
-        Log(L"%s%s", line.c_str(), dj.Disjoint ? L" (disjoint)" : L"");
+        Log(L"%s%s | gather radius %.0f x %.0f", line.c_str(), dj.Disjoint ? L" (disjoint)" : L"", lastRadiusH_,
+            lastRadiusV_);
     }
 }
 

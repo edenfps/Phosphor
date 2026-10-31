@@ -12,6 +12,7 @@ struct Look
     float whiteK = 6500.0f;       // white point colour temperature
     float sourceW = 0.0f;         // content resolution the tube scans; 0 = native
     float sourceH = 0.0f;
+    float sourceAspect = 0.0f;    // displayed width/height of the source; 0 = square pixels
     float lines = 0.0f;           // shorthand: scanline count at native horizontal res
     float spotMinMm = 0.03f;      // beam spot core sigma at black
     float spotMaxMm = 0.06f;      // beam spot core sigma at full drive
@@ -47,6 +48,7 @@ struct AppProfile
     std::wstring preset;   // "" = keep current
     float sourceW = -1.0f; // -1 = keep preset's
     float sourceH = -1.0f;
+    bool pause = false;    // phosphor = off: no overlay at all while this exe has focus
 };
 
 struct Config
@@ -59,6 +61,16 @@ struct Config
     int subpixelLayout = 0;      // index into the panel layout table (main.cpp), 0 = off
     bool autoResolution = false; // detect stretched lower-res content and redraw it at its real resolution
     bool detectDebug = false;    // log every resolution analysis
+    bool perfDebug = false;      // log frame pacing and GPU time once a second
+    bool presentVsync = false;   // wait for vblank on present (adds up to a refresh of lag)
+    bool fastPath = true;        // fused compute beam (off = pixel-shader path, for comparison)
+    bool gpuPriority = true;     // overlay work preempts the game's on a saturated GPU
+    bool gameCapture = false;
+    bool gameGpuYield = true;    // fullscreen game in front runs at IDLE GPU priority so the overlay isn't starved
+    int swapBuffers = 2;         // overlay swapchain buffers
+    int frameLatency = 1;        // frames the CPU may queue ahead of the GPU
+    int debugMode = 0;           // pacing tests: 1 = present black (no CRT work), 2 = capture with overlay hidden
+    bool forceComposition = false; // SDR: BitBlt swapchain (never MPO); measured worse, kept for tests     // capture a borderless fullscreen game's own window instead of the desktop
     std::wstring menuKey = L"Insert"; // opens the toggles menu
     // Rolling scan (CRT motion clarity)
     bool motion = false;         // start with it on

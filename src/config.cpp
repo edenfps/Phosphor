@@ -52,6 +52,12 @@ static void SetLookKey(Look& l, const std::wstring& k, const std::wstring& v)
     else if (k == L"white_k") l.whiteK = f;
     else if (k == L"source") ParseSource(v, l.sourceW, l.sourceH);
     else if (k == L"lines") l.lines = f;
+    else if (k == L"source_aspect")
+    {
+        // "4:3" or a number
+        size_t c = v.find(L':');
+        l.sourceAspect = c == std::wstring::npos ? f : float(_wtof(v.c_str()) / std::max(_wtof(v.c_str() + c + 1), 1e-6));
+    }
     else if (k == L"spot_min_mm") l.spotMinMm = f;
     else if (k == L"spot_max_mm") l.spotMaxMm = f;
     else if (k == L"spot_power") l.spotPower = f;
@@ -143,6 +149,7 @@ bool LoadConfig(const std::wstring& path, Config& cfg)
         {
             if (k == L"preset") app->preset = v;
             else if (k == L"source") ParseSource(v, app->sourceW, app->sourceH);
+            else if (k == L"phosphor") app->pause = Lower(v) == L"off";
             else Log(L"config: unknown app key '%s'", k.c_str());
         }
         else if (general)
@@ -157,6 +164,16 @@ bool LoadConfig(const std::wstring& path, Config& cfg)
             else if (k == L"auto_resolution") c.autoResolution = Lower(v) == L"on" || v == L"1";
             else if (k == L"detect_debug") c.detectDebug = Lower(v) == L"on" || v == L"1";
             else if (k == L"menu_key") c.menuKey = v;
+            else if (k == L"perf_debug") c.perfDebug = Lower(v) == L"on" || v == L"1";
+            else if (k == L"present_vsync") c.presentVsync = Lower(v) == L"on" || v == L"1";
+            else if (k == L"fast_path") c.fastPath = !(Lower(v) == L"off" || v == L"0");
+            else if (k == L"gpu_priority") c.gpuPriority = !(Lower(v) == L"off" || v == L"0");
+            else if (k == L"force_composition") c.forceComposition = !(Lower(v) == L"off" || v == L"0");
+            else if (k == L"swap_buffers") c.swapBuffers = _wtoi(v.c_str());
+            else if (k == L"frame_latency") c.frameLatency = _wtoi(v.c_str());
+            else if (k == L"debug_mode") c.debugMode = _wtoi(v.c_str());
+            else if (k == L"game_gpu_yield") c.gameGpuYield = !(Lower(v) == L"off" || v == L"0");
+            else if (k == L"game_capture") c.gameCapture = !(Lower(v) == L"off" || v == L"0");
             else if (k == L"motion") c.motion = Lower(v) == L"on" || v == L"1";
             else if (k == L"crt_hz") c.crtHz = (float)_wtof(v.c_str());
             else if (k == L"motion_gain") c.motionGain = (float)_wtof(v.c_str());

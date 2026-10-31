@@ -28,6 +28,7 @@ struct FrameParams
     float deblur = 0.0f;        // strength, 0 = off
     float deblurMaxPx = 48.0f;  // largest smear compensated
     bool motionDebug = false;   // tint by motion vectors
+    bool fastPath = true;       // fused compute beam where possible
 };
 
 class Renderer
@@ -103,6 +104,10 @@ private:
     std::wstring shaderPath_;
     ComPtr<ID3D11VertexShader> vs_;
     ComPtr<ID3D11PixelShader> psDecode_, psResample_, psBeamH_, psBeamV_, psDown_, psHalo_, psFinal_;
+    // Fused decode + beam for native resolution (compute; see CS_BeamNative).
+    ComPtr<ID3D11ComputeShader> csBeam_[3]; // gather radius 1, 2, 3
+    ComPtr<ID3D11UnorderedAccessView> beamUav_;
+    ID3D11Texture2D* beamUavTex_ = nullptr;
     ComPtr<ID3D11Buffer> frameCB_, passCB_;
     ComPtr<ID3D11SamplerState> linear_, linearBorder_;
     ComPtr<ID3D11Texture2D> srcTex_;
@@ -110,6 +115,7 @@ private:
     ComPtr<ID3D11ShaderResourceView> osdSrv_;
 
     bool profile_ = false;
+    float lastRadiusH_ = 0, lastRadiusV_ = 0;
     std::vector<std::pair<const wchar_t*, ComPtr<ID3D11Query>>> marks_;
     void Mark(const wchar_t* name);
 
@@ -122,6 +128,10 @@ private:
     bool lumaFlip_ = false, lumaValid_ = false;
     Target motionCoarse_, motionMid_, motionFine_, composed_;
     ComPtr<ID3D11PixelShader> psChangeMask_, psProbe_;
+    // Tube curve lookup for HDR desktops: code value from linear, then gamma.
+    ComPtr<ID3D11ShaderResourceView> tubeLut_;
+    float tubeLutGamma_ = -1;
+    void EnsureTubeLut(float gamma);
     ComPtr<ID3D11Texture2D> probeTex_, probeStaging_;
     ComPtr<ID3D11RenderTargetView> probeRtv_;
     ComPtr<ID3D11ShaderResourceView> probeSrcSrv_;

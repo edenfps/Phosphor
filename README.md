@@ -173,8 +173,21 @@ flowchart LR
 ```
 
 Every optical step conserves total light, so the average brightness of an image is unchanged to
-within 0.4%. The pipeline costs about 2 ms per frame on an RTX 3080 at 4K, and only runs when the
+within 0.4%. The pipeline costs about 1 ms per frame on an RTX 3080 at 4K, and only runs when the
 screen changes.
+
+## Games and performance
+
+What you see is the overlay's frames, so a game that maxes out the GPU could starve the overlay and
+leave the screen at ~50 fps however fast the game renders. To prevent that, Phosphor lowers the GPU
+priority of a fullscreen app in front to *idle* (`game_gpu_yield = on`) and restores it when it loses
+focus or Phosphor stops. Every game frame then reaches the screen with even pacing.
+
+The overlay's cost comes out of the game's GPU time instead: about 1 ms for the CRT model plus about
+1 ms for Windows to composite the game and capture the screen. At 240 Hz a GPU-bound game needs that
+headroom to hold full refresh, so lower its settings or cap its frame rate a little below where it
+runs without Phosphor. `perf_debug = on` logs frames captured and shown, frame pacing and GPU time
+once a second to `phosphor.log`.
 
 ## Command-line tools
 
@@ -183,6 +196,7 @@ phosphor --image in.png out.png [--preset "Best of both"] [--source 1920x1080] [
 phosphor --pattern chart.png 3840 2160     # calibration chart
 phosphor --detect frame.png                # run the resolution detector on an image
 phosphor --list                            # list displays
+phosphor --stress 380 15 [fps cap]         # fake GPU-heavy fullscreen game, for pacing tests
 ```
 
 `--bench` also logs per-pass GPU timings.
@@ -190,6 +204,7 @@ phosphor --list                            # list displays
 ## Known limits
 
 - **Latency:** about one refresh of added latency (~4 ms at 240 Hz), the cost of capture-and-overlay.
+- **GPU cost in games:** about 2 ms per frame comes out of the game's budget. See [Games and performance](#games-and-performance).
 - **VRR:** G-Sync / FreeSync can't engage under the overlay.
 - **Exclusive fullscreen:** those games draw over the overlay.
 - **Physics a panel can't reproduce:** the OLED's own subpixels stay visible up close, and the depth of a

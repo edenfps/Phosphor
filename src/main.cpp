@@ -10,16 +10,22 @@
 #include "display.h"
 #include "image_io.h"
 #include "renderer.h"
+#include "wgc.h"
+#include <d3d11_4.h>
 #include <shellapi.h>
 #include <dwmapi.h>
 #include <DirectXPackedVector.h>
 #include <algorithm>
 #include <cmath>
+#include <functional>
 #include <map>
+
+int RunStress(const std::wstring& monitor, int iters, int seconds, int capFps);
 
 namespace
 {
-enum { HK_TOGGLE = 1, HK_SPLIT, HK_PRESET, HK_RELOAD, HK_QUIT, HK_BEAM, HK_LAYOUT, HK_MOTION, HK_DEBLUR, HK_VECTORS, HK_CHARACTER, HK_AUTORES, HK_MENU };
+enum { HK_TOGGLE = 1, HK_SPLIT, HK_PRESET, HK_RELOAD, HK_QUIT, HK_BEAM, HK_LAYOUT, HK_MOTION, HK_DEBLUR, HK_VECTORS, HK_CHARACTER, HK_AUTORES, HK_MENU,
+       HK_NAV_UP, HK_NAV_DOWN, HK_NAV_LEFT, HK_NAV_RIGHT, HK_NAV_ENTER, HK_NAV_BACK, HK_NAV_ESC };
 enum { ID_ENABLE = 100, ID_SPLIT, ID_RELOAD, ID_OPENCFG, ID_EXIT, ID_AUTORES, ID_MOTION, ID_CHARACTER,
        ID_PRESET0 = 200, ID_BEAM0 = 300, ID_LAYOUT0 = 400 };
 const UINT WM_TRAY = WM_APP + 1;
@@ -35,6 +41,8 @@ struct App
     ComPtr<ID3D11Device> dev;
     ComPtr<ID3D11DeviceContext> ctx;
     ComPtr<IDXGIOutputDuplication> dup;
+    WindowCapture wcap;            // borderless fullscreen game: its window, not the desktop
+    HWND wcapFailed = nullptr;     // don't retry this window until focus moves
     DXGI_FORMAT dupFmt = DXGI_FORMAT_UNKNOWN;
     ComPtr<ID3D11Texture2D> frame;
     ComPtr<IDXGISwapChain1> sc;
@@ -54,7 +62,13 @@ struct App
     bool characterOff = false; // A/B: veiling glow + analog softness forced off
     // Automatic resolution detection
     int autoRes = -1;          // override: -1 = from config
+    bool pausedByApp = false;  // switched off by a game profile with phosphor = off
     UINT menuVk = 0;           // registered menu key
+    // Resolution override from the menu: 0 = the look decides (and auto
+    // detection), 1 = manual WxH, 2 = always native.
+    int resMode = 0;
+    int manualW = 0, manualH = 0;
+    float manualAspect = 0;    // displayed aspect for non-square pixels, 0 = square
     int autoW = 0, autoH = 0;  // detected source size, 0 = native
     DWORD lastProbe = 0;
     bool framesSinceProbe = false;
@@ -73,10 +87,34 @@ struct App
 } g;
 
 void ShowOsd(DWORD ms = 6000);
+void SetEnabled(bool on);
 void RegisterMenuKey();
 
 bool MotionOn() { return g.motion >= 0 ? g.motion != 0 : g.cfg.motion; }
 bool AutoResOn() { return g.autoRes >= 0 ? g.autoRes != 0 : g.cfg.autoResolution; }
+
+// Raised GPU priority: what's on screen is the overlay's frames, so when a
+// game saturates the GPU the overlay's ~1 ms must go first. At normal priority
+// it queues behind the game's frames and the screen drops to 30 fps.
+void ApplyGpuPriority()
+{
+    ComPtr<IDXGIDevice> dxgiDev;
+    if (g.dev && SUCCEEDED(g.dev.As(&dxgiDev)))
+        dxgiDev->SetGPUThreadPriority(g.cfg.gpuPriority ? 7 : 0);
+}
+
+// GPU scheduling class of the whole process. Set before the device exists:
+// it may only apply to GPU contexts created afterwards. HIGH needs no admin,
+// REALTIME (5) does.
+void SetGpuSchedulingClass(int cls)
+{
+    using SetClass = LONG(APIENTRY*)(HANDLE, int);
+    auto fn = (SetClass)GetProcAddress(GetModuleHandleW(L"gdi32.dll"), "D3DKMTSetProcessSchedulingPriorityClass");
+    if (!fn)
+        return;
+    LONG st = fn(GetCurrentProcess(), cls);
+    Log(L"gpu scheduling class %d: %s", cls, st == 0 ? L"ok" : L"refused");
+}
 ResolutionDetector gDetector;
 // Motion pre-deblur is shelved: measured at ~0.5% less perceived blur, and even
 // an optimal version is capped near 15-24% because pre-compensation would need
@@ -177,6 +215,30 @@ void NoteRefresh(long long idx)
 
 int MotionK() { return std::max(1, int(std::lround(1000.0 / g.refreshMs / std::max(g.cfg.crtHz, 1.0f)))); }
 
+// ---- In-overlay toggles menu (drawn in the OSD style, driven by keyboard).
+struct MenuItem
+{
+    enum Kind { Action, Toggle, Choice, Submenu };
+    std::wstring label;
+    Kind kind = Action;
+    bool on = false;                               // Toggle state / Choice selected
+    std::function<void()> run;                     // Action, Toggle, Choice
+    std::function<std::vector<MenuItem>()> items;  // Submenu
+    std::wstring value;                            // shown dimmed on the right
+};
+struct MenuLevel
+{
+    std::wstring title;
+    std::function<std::vector<MenuItem>()> items;
+    int sel = 0;
+};
+struct MenuState
+{
+    bool open = false;
+    std::vector<MenuLevel> stack;
+    DWORD lastInput = 0;
+} gMenu;
+
 // Beam sharpness override cycled with Ctrl+Alt+Shift+B, applied on top of
 // whichever look is active. Level 0 keeps the look's own beam.
 struct BeamLevel
@@ -245,6 +307,15 @@ Look EffectiveLook()
         l.sourceW = float(g.autoW);
         l.sourceH = float(g.autoH);
     }
+    if (g.resMode == 1)
+    {
+        l.sourceW = float(g.manualW);
+        l.sourceH = float(g.manualH);
+        l.sourceAspect = g.manualAspect;
+        l.lines = 0;
+    }
+    else if (g.resMode == 2)
+        l.sourceW = l.sourceH = l.lines = 0;
     if (g.characterOff)
     {
         l.veil = 0;
@@ -297,8 +368,22 @@ void CheckApp()
     {
         g.activeApp = found;
         g.dirty = true;
-        ShowOsd();
         Log(found >= 0 ? L"app profile: %s" : L"app profile: none (%s)", exe.c_str());
+        // phosphor = off: step out of the way completely (full game performance),
+        // and come back when the game loses focus.
+        bool pause = found >= 0 && g.cfg.apps[found].pause;
+        if (pause && g.enabled)
+        {
+            g.pausedByApp = true;
+            SetEnabled(false);
+            return;
+        }
+        if (!pause && g.pausedByApp)
+        {
+            g.pausedByApp = false;
+            SetEnabled(true);
+        }
+        ShowOsd();
     }
 }
 
@@ -337,6 +422,7 @@ FrameParams MakeParams()
     fp.deblur = DeblurOn() ? g.cfg.deblurStrength : 0.0f;
     fp.deblurMaxPx = g.cfg.deblurMaxPx;
     fp.motionDebug = g.vectors;
+    fp.fastPath = g.cfg.fastPath;
     return fp;
 }
 
@@ -348,14 +434,18 @@ void UpdateTrayTip()
     Shell_NotifyIconW(NIM_MODIFY, &g.tray);
 }
 
+void YieldGame(DWORD pid);
+
 void Teardown()
 {
+    YieldGame(0);
     if (g.overlay)
         ShowWindow(g.overlay, SW_HIDE);
     g.visible = false;
     g.rtv.Reset();
     g.sc.Reset();
     g.frame.Reset();
+    g.wcap.Stop();
     g.dup.Reset();
     if (g.ctx)
     {
@@ -402,6 +492,11 @@ bool Setup()
         }
     }
 
+    // Window capture hands frames to the device from a system thread.
+    ComPtr<ID3D11Multithread> mt;
+    if (SUCCEEDED(g.dev.As(&mt)))
+        mt->SetMultithreadProtected(TRUE);
+
     ComPtr<IDXGIOutput5> o5;
     if (FAILED(d.output.As(&o5)))
         return false;
@@ -443,10 +538,27 @@ bool Setup()
     scd.Format = d.hdr ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R10G10B10A2_UNORM;
     scd.SampleDesc.Count = 1;
     scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    scd.BufferCount = 2;
+    scd.BufferCount = std::clamp(g.cfg.swapBuffers, 2, 4);
     scd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     scd.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
-    hr = factory->CreateSwapChainForHwnd(g.dev.Get(), g.overlay, &scd, nullptr, nullptr, &g.sc);
+    // Keep the overlay composed by DWM. When DWM promotes a flip-model overlay
+    // to a hardware overlay plane (MPO) while a game loads the GPU, the screen
+    // collapses to 10-50 fps of heavy stutter. A BitBlt-model swapchain is
+    // never promoted (one extra 4K copy, ~0.1 ms). HDR needs flip model.
+    // No DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING either: same collapse.
+    hr = E_FAIL;
+    if (!d.hdr && g.cfg.forceComposition)
+    {
+        DXGI_SWAP_CHAIN_DESC1 blt = scd;
+        blt.BufferCount = 1;
+        blt.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+        blt.Scaling = DXGI_SCALING_STRETCH;
+        hr = factory->CreateSwapChainForHwnd(g.dev.Get(), g.overlay, &blt, nullptr, nullptr, &g.sc);
+        if (FAILED(hr))
+            Log(L"BitBlt swapchain failed 0x%08x, using flip model", hr);
+    }
+    if (FAILED(hr))
+        hr = factory->CreateSwapChainForHwnd(g.dev.Get(), g.overlay, &scd, nullptr, nullptr, &g.sc);
     if (FAILED(hr))
     {
         Log(L"CreateSwapChainForHwnd failed 0x%08x", hr);
@@ -461,12 +573,8 @@ bool Setup()
     }
     ComPtr<IDXGIDevice1> dxgiDev;
     if (SUCCEEDED(g.dev.As(&dxgiDev)))
-    {
-        dxgiDev->SetMaximumFrameLatency(1);
-        // Rolling-scan slices have a hard per-refresh deadline.
-        HRESULT pr = dxgiDev->SetGPUThreadPriority(7);
-        Log(L"gpu priority +7: %s", SUCCEEDED(pr) ? L"ok" : L"refused");
-    }
+        dxgiDev->SetMaximumFrameLatency(std::clamp(g.cfg.frameLatency, 1, 3));
+    ApplyGpuPriority();
 
     ComPtr<ID3D11Texture2D> bb;
     g.sc->GetBuffer(0, IID_PPV_ARGS(&bb));
@@ -487,7 +595,8 @@ void RebuildOsd()
         return;
     bool info = GetTickCount() < g.osdUntil;
     g.osdInfo = info;
-    if (!info && g.split <= 0)
+    info = info && !gMenu.open; // the menu replaces the info panel
+    if (!info && g.split <= 0 && !gMenu.open)
     {
         g.renderer.ClearOsd();
         return;
@@ -621,6 +730,66 @@ void RebuildOsd()
             Text(smallFont, hdr, x + pad, cy + gap, tw, true);
     }
 
+    if (gMenu.open && !gMenu.stack.empty())
+    {
+        // Breadcrumb title, one row per item, footer with the keys.
+        MenuLevel& lv = gMenu.stack.back();
+        std::vector<MenuItem> items = lv.items();
+        lv.sel = std::clamp(lv.sel, 0, std::max(0, int(items.size()) - 1));
+        std::wstring crumb;
+        for (size_t i = 0; i < gMenu.stack.size(); i++)
+            crumb += (i ? L"   \x203A   " : L"") + gMenu.stack[i].title;
+        int pw = S(1000), pad = S(34), rowH = S(56);
+        int x = (int(w) - pw) / 2, y = S(300);
+        int titleH = Text(titleFont, crumb, 0, 0, pw - 2 * pad, false);
+        int footH = S(40);
+        int ph = pad + titleH + S(24) + int(items.size()) * rowH + S(20) + footH + pad;
+        Panel({x, y, x + pw, y + ph});
+        int cy = y + pad;
+        Text(titleFont, crumb, x + pad, cy, pw - 2 * pad, true);
+        cy += titleH + S(24);
+        SelectObject(dc, bodyFont);
+        for (int i = 0; i < int(items.size()); i++)
+        {
+            const MenuItem& it = items[i];
+            RECT row{x + S(12), cy, x + pw - S(12), cy + rowH};
+            if (i == lv.sel)
+            {
+                HBRUSH b = CreateSolidBrush(RGB(48, 255, 0)); // lighter band
+                FillRect(dc, &row, b);
+                DeleteObject(b);
+            }
+            int tx = x + pad;
+            if (it.kind == MenuItem::Toggle || it.kind == MenuItem::Choice)
+            {
+                SetTextColor(dc, it.on ? RGB(255, 0, 0) : RGB(120, 0, 0));
+                std::wstring mark = it.on ? L"\x25CF" : L"\x25CB";
+                TextOutW(dc, tx, cy + S(10), mark.c_str(), int(mark.size()));
+                tx += S(46);
+            }
+            SetTextColor(dc, RGB(255, 0, 0));
+            TextOutW(dc, tx, cy + S(10), it.label.c_str(), int(it.label.size()));
+            std::wstring right = it.value;
+            if (it.kind == MenuItem::Submenu)
+                right += (right.empty() ? L"" : L"   ") + std::wstring(L"\x203A");
+            else if (it.kind == MenuItem::Toggle)
+                right = it.on ? L"ON" : L"off";
+            if (!right.empty())
+            {
+                SIZE sz;
+                GetTextExtentPoint32W(dc, right.c_str(), int(right.size()), &sz);
+                SetTextColor(dc, RGB(150, 0, 0));
+                TextOutW(dc, x + pw - pad - sz.cx, cy + S(10), right.c_str(), int(right.size()));
+            }
+            cy += rowH;
+        }
+        cy += S(20);
+        SetTextColor(dc, RGB(150, 0, 0));
+        std::wstring keys = L"\x2191\x2193 select     Enter / \x2192 choose     \x2190 / Backspace back     Esc close";
+        Text(smallFont, keys, x + pad, cy, pw - 2 * pad, true);
+        SetTextColor(dc, RGB(255, 0, 0));
+    }
+
     if (g.split > 0)
     {
         int cx = int(g.split * w);
@@ -646,6 +815,22 @@ void RebuildOsd()
         rg[i * 2 + 1] = uint8_t(std::min(255, r + gch));
     }
     g.renderer.SetOsd(rg.data(), w, h);
+    // Debug: osd.flag next to the exe saves what the OSD looks like over black.
+    std::wstring osdFlag = ExeDir() + L"\\osd.flag";
+    if (GetFileAttributesW(osdFlag.c_str()) != INVALID_FILE_ATTRIBUTES)
+    {
+        DeleteFileW(osdFlag.c_str());
+        std::vector<uint8_t> vis(size_t(w) * h * 4);
+        for (size_t i = 0; i < size_t(w) * h; i++)
+        {
+            float t = rg[i * 2] / 255.0f, pnl = rg[i * 2 + 1] / 255.0f;
+            float bg = 0.07f * (1.0f - 0.75f * pnl); // dark desktop under the panel
+            uint8_t v = uint8_t(std::clamp(bg * (1 - t) + t, 0.0f, 1.0f) * 255);
+            vis[i * 4] = vis[i * 4 + 1] = vis[i * 4 + 2] = v;
+            vis[i * 4 + 3] = 255;
+        }
+        SavePngBGRA(ExeDir() + L"\\osd.png", vis.data(), w, h, w * 4);
+    }
 
     SelectObject(dc, oldBmp);
     DeleteObject(bmp);
@@ -663,17 +848,19 @@ void ShowOsd(DWORD ms)
 }
 
 // Debug: save the raw captured desktop (before any CRT processing) as a PNG.
-void DumpFrame(const std::wstring& path)
+void DumpFrame(const std::wstring& path, ID3D11Texture2D* tex = nullptr)
 {
+    if (!tex)
+        tex = g.frame.Get();
     D3D11_TEXTURE2D_DESC td;
-    g.frame->GetDesc(&td);
+    tex->GetDesc(&td);
     td.Usage = D3D11_USAGE_STAGING;
     td.BindFlags = 0;
     td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
     ComPtr<ID3D11Texture2D> st;
     if (FAILED(g.dev->CreateTexture2D(&td, nullptr, &st)))
         return;
-    g.ctx->CopyResource(st.Get(), g.frame.Get());
+    g.ctx->CopyResource(st.Get(), tex);
     D3D11_MAPPED_SUBRESOURCE m;
     if (FAILED(g.ctx->Map(st.Get(), 0, D3D11_MAP_READ, 0, &m)))
         return;
@@ -704,14 +891,294 @@ void DumpFrame(const std::wstring& path)
     Log(ok ? L"dumped frame to %s" : L"frame dump failed: %s", path.c_str());
 }
 
+// Frame pacing diagnostics (perf_debug = on): captured game frames, frames
+// shown, frames replaced before we got to them, CPU and GPU time per frame.
+struct PerfStats
+{
+    DWORD since = 0;
+    int captured = 0, rendered = 0, superseded = 0;
+    double renderCpuMs = 0, presentMs = 0, gpuMs = 0, gpuMax = 0;
+    int gpuSamples = 0;
+    // Pacing: interval between captured frames.
+    LONGLONG lastCap = 0;
+    double capSum = 0, capSq = 0, capMax = 0;
+    int capN = 0;
+    int spikes = 0; // logged this second (capped)
+    struct Q
+    {
+        ComPtr<ID3D11Query> disjoint, start, end;
+        bool pending = false;
+    } q[4];
+    int qi = 0;
+} gPerf;
+
+void PerfFrameGpu(bool begin)
+{
+    if (!g.cfg.perfDebug)
+        return;
+    auto& q = gPerf.q[gPerf.qi];
+    if (begin)
+    {
+        if (q.pending) // not read back yet: skip timing this frame
+            return;
+        D3D11_QUERY_DESC dj{D3D11_QUERY_TIMESTAMP_DISJOINT, 0}, ts{D3D11_QUERY_TIMESTAMP, 0};
+        if (!q.disjoint)
+        {
+            g.dev->CreateQuery(&dj, &q.disjoint);
+            g.dev->CreateQuery(&ts, &q.start);
+            g.dev->CreateQuery(&ts, &q.end);
+        }
+        g.ctx->Begin(q.disjoint.Get());
+        g.ctx->End(q.start.Get());
+        return;
+    }
+    if (q.pending || !q.disjoint)
+        return;
+    g.ctx->End(q.end.Get());
+    g.ctx->End(q.disjoint.Get());
+    q.pending = true;
+    gPerf.qi = (gPerf.qi + 1) % 4;
+    // Read back finished frames without waiting.
+    for (auto& r : gPerf.q)
+    {
+        if (!r.pending)
+            continue;
+        D3D11_QUERY_DATA_TIMESTAMP_DISJOINT d{};
+        UINT64 a = 0, b = 0;
+        if (g.ctx->GetData(r.disjoint.Get(), &d, sizeof(d), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK ||
+            g.ctx->GetData(r.start.Get(), &a, sizeof(a), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK ||
+            g.ctx->GetData(r.end.Get(), &b, sizeof(b), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK)
+            continue;
+        r.pending = false;
+        if (!d.Disjoint && b > a)
+        {
+            double ms = double(b - a) * 1000.0 / d.Frequency;
+            gPerf.gpuMs += ms;
+            gPerf.gpuMax = std::max(gPerf.gpuMax, ms);
+            gPerf.gpuSamples++;
+            if (ms > 6.0 && gPerf.spikes++ < 5)
+                Log(L"spike: phosphor gpu frame took %.1f ms (GPU busy with the game, or a stall)", ms);
+        }
+    }
+}
+
+void PerfTick()
+{
+    if (!g.cfg.perfDebug)
+        return;
+    DWORD now = GetTickCount();
+    if (now - gPerf.since < 1000)
+        return;
+    if (gPerf.since && gPerf.rendered)
+    {
+        // How DWM shows the overlay: composed (one extra refresh, no VRR) or
+        // flipped straight to the screen.
+        const wchar_t* mode = L"?";
+        ComPtr<IDXGISwapChainMedia> media;
+        DXGI_FRAME_STATISTICS_MEDIA fs{};
+        if (SUCCEEDED(g.sc.As(&media)) && SUCCEEDED(media->GetFrameStatisticsMedia(&fs)))
+            mode = fs.CompositionMode == DXGI_FRAME_PRESENTATION_MODE_COMPOSED  ? L"composed"
+                   : fs.CompositionMode == DXGI_FRAME_PRESENTATION_MODE_OVERLAY ? L"overlay plane"
+                   : fs.CompositionMode == DXGI_FRAME_PRESENTATION_MODE_NONE    ? L"direct flip"
+                                                                                : L"composition failure";
+        double mean = gPerf.capN ? gPerf.capSum / gPerf.capN : 0;
+        double sd = gPerf.capN ? std::sqrt(std::max(gPerf.capSq / gPerf.capN - mean * mean, 0.0)) : 0;
+        Log(L"perf: %s, captured %d/s, shown %d/s, replaced before render %d | frame interval %.2f ms avg, %.2f sd, "
+            L"%.1f max | cpu render %.2f ms, present %.2f ms | gpu %.2f ms avg, %.2f max | %s",
+            g.wcap.Active() ? L"game window" : L"desktop", gPerf.captured, gPerf.rendered, gPerf.superseded, mean, sd,
+            gPerf.capMax, gPerf.renderCpuMs / gPerf.rendered, gPerf.presentMs / gPerf.rendered,
+            gPerf.gpuSamples ? gPerf.gpuMs / gPerf.gpuSamples : 0.0, gPerf.gpuMax, mode);
+    }
+    gPerf.since = now;
+    gPerf.capSum = gPerf.capSq = gPerf.capMax = 0;
+    gPerf.capN = gPerf.spikes = 0;
+    gPerf.captured = gPerf.rendered = gPerf.superseded = gPerf.gpuSamples = 0;
+    gPerf.renderCpuMs = gPerf.presentMs = gPerf.gpuMs = gPerf.gpuMax = 0;
+}
+
+// A newly captured frame (desktop or game window) becomes the current one.
+void TakeFrame(ID3D11Texture2D* tex)
+{
+    if (g.newFrame)
+        gPerf.superseded++; // previous capture never got rendered
+    gPerf.captured++;
+    LONGLONG now = Qpc();
+    if (g.cfg.perfDebug && gPerf.lastCap)
+    {
+        static LONGLONG freq = [] {
+            LARGE_INTEGER f;
+            QueryPerformanceFrequency(&f);
+            return f.QuadPart;
+        }();
+        double ms = double(now - gPerf.lastCap) * 1000.0 / freq;
+        if (ms < 250) // ignore idle desktop gaps
+        {
+            double prevMean = gPerf.capN ? gPerf.capSum / gPerf.capN : ms;
+            gPerf.capSum += ms;
+            gPerf.capSq += ms * ms;
+            gPerf.capMax = std::max(gPerf.capMax, ms);
+            gPerf.capN++;
+            if (gPerf.capN > 20 && ms > std::max(3.0 * prevMean, 12.0) && gPerf.spikes++ < 5)
+                Log(L"spike: no new %s frame for %.1f ms (usual %.1f ms)", g.wcap.Active() ? L"game" : L"desktop", ms,
+                    prevMean);
+        }
+    }
+    gPerf.lastCap = now;
+    // The acquired surface can differ from the mode format (Windows colour
+    // management hands out FP16 or 10-bit even in SDR). CopyResource silently
+    // does nothing on a mismatch, which shows as a black screen, so follow it.
+    D3D11_TEXTURE2D_DESC sd, fd;
+    tex->GetDesc(&sd);
+    g.frame->GetDesc(&fd);
+    if (sd.Format != fd.Format)
+    {
+        Log(L"capture surface is format %d (expected %d), following it", sd.Format, fd.Format);
+        fd.Format = sd.Format;
+        g.frame.Reset();
+        if (FAILED(g.dev->CreateTexture2D(&fd, nullptr, &g.frame)))
+        {
+            g.needSetup = true;
+            return;
+        }
+        g.dupFmt = sd.Format;
+    }
+    g.ctx->CopyResource(g.frame.Get(), tex);
+    g.haveFrame = true;
+    g.dirty = true;
+    g.newFrame = true;
+    g.motionShown = true;
+    g.framesSinceProbe = true;
+    g.lastCaptureQpc = now;
+}
+
+// A borderless fullscreen game in front is captured from its own window:
+// frames arrive as the game presents them rather than after DWM composes the
+// desktop. Anything else (desktop, windowed apps, menus on top): the desktop.
+// Foreground window exactly covering our display (borderless fullscreen game,
+// fullscreen video), not the shell.
+bool IsFullscreenApp(HWND fg)
+{
+    if (!fg || fg == g.overlay || fg == g.ctrl || !IsWindowVisible(fg) || IsIconic(fg))
+        return false;
+    RECT r;
+    wchar_t cls[64] = {};
+    GetClassNameW(fg, cls, 64);
+    return GetWindowRect(fg, &r) && EqualRect(&r, &g.disp.rect) && wcscmp(cls, L"Progman") != 0 &&
+           wcscmp(cls, L"WorkerW") != 0 && wcscmp(cls, L"Shell_TrayWnd") != 0 && ForegroundExe() != L"explorer.exe";
+}
+
+// What's on screen is the overlay's frames, so a game that saturates the GPU
+// must not starve them. Raising our own priority does nothing measurable; the
+// one class the scheduler really honours is IDLE: a game at IDLE gets the GPU
+// whenever the overlay and DWM aren't using it. Measured with a 4K fake game
+// at 100% GPU: 52 -> 166 fps actually shown (every game frame, sd 1.5 ms),
+// game 239 -> 163 fps (the overlay's real cost, now paid instead of skipped).
+struct
+{
+    DWORD pid = 0;
+    HANDLE proc = nullptr;
+    int oldClass = 2;
+} gYield;
+
+void YieldGame(DWORD pid)
+{
+    if (pid == gYield.pid)
+        return;
+    using GetClass = LONG(APIENTRY*)(HANDLE, int*);
+    using SetClass = LONG(APIENTRY*)(HANDLE, int);
+    HMODULE gdi = GetModuleHandleW(L"gdi32.dll");
+    auto getFn = (GetClass)GetProcAddress(gdi, "D3DKMTGetProcessSchedulingPriorityClass");
+    auto setFn = (SetClass)GetProcAddress(gdi, "D3DKMTSetProcessSchedulingPriorityClass");
+    if (gYield.proc)
+    {
+        if (setFn)
+            setFn(gYield.proc, gYield.oldClass);
+        CloseHandle(gYield.proc);
+        Log(L"game gpu priority restored (pid %lu)", gYield.pid);
+        gYield.proc = nullptr;
+    }
+    gYield.pid = pid;
+    if (!pid || !getFn || !setFn || pid == GetCurrentProcessId())
+        return;
+    gYield.proc = OpenProcess(PROCESS_SET_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!gYield.proc)
+    {
+        Log(L"game gpu priority: can't open pid %lu (protected?)", pid);
+        return;
+    }
+    int cls = 2;
+    if (getFn(gYield.proc, &cls) != 0)
+        cls = 2;
+    gYield.oldClass = cls;
+    LONG st = setFn(gYield.proc, 0 /* IDLE */);
+    Log(L"game gpu priority: %s (pid %lu) set to idle: %s", ForegroundExe().c_str(), pid, st == 0 ? L"ok" : L"refused");
+    if (st != 0)
+    {
+        CloseHandle(gYield.proc);
+        gYield.proc = nullptr;
+    }
+}
+
+void CheckGameWindow()
+{
+    HWND fg = GetForegroundWindow();
+    bool fullscreen = IsFullscreenApp(fg);
+    DWORD pid = 0;
+    if (fullscreen && g.cfg.gameGpuYield)
+        GetWindowThreadProcessId(fg, &pid);
+    YieldGame(pid);
+    bool want = g.cfg.gameCapture && g.dev && fullscreen;
+    if (fg != g.wcapFailed)
+        g.wcapFailed = nullptr;
+    if (!want || fg == g.wcapFailed)
+    {
+        if (g.wcap.Target())
+        {
+            g.wcap.Stop();
+            Log(L"capture: desktop");
+            g.dirty = true;
+        }
+        return;
+    }
+    if (g.wcap.Target() == fg && g.wcap.Active())
+        return;
+    if (g.wcap.Start(g.dev.Get(), fg, g.disp.hdr))
+        Log(L"capture: game window (%s)", ForegroundExe().c_str());
+    else
+        g.wcapFailed = fg;
+}
+
 void RenderPresent()
 {
-    g.renderer.Render(g.frame.Get(), g.rtv.Get(), g.w, g.h, MakeParams());
+    LARGE_INTEGER f, t0, t1, t2;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&t0);
+    PerfFrameGpu(true);
+    if (g.cfg.debugMode == 1)
+    {
+        float black[4] = {0, 0, 0, 1};
+        g.ctx->ClearRenderTargetView(g.rtv.Get(), black); // pacing test: no CRT work
+    }
+    else
+        g.renderer.Render(g.frame.Get(), g.rtv.Get(), g.w, g.h, MakeParams());
+    PerfFrameGpu(false);
     g.newFrame = false;
-    // Flip model releases the RTV binding on present; rebind each frame.
-    g.sc->Present(1, 0);
+    QueryPerformanceCounter(&t1);
+    // No vsync wait by default: hand the frame over at once and let DWM show
+    // the newest one each refresh (flip model drops a superseded frame). With
+    // vsync, a frame that finishes just late costs a whole extra refresh and
+    // the game frames behind it get skipped.
+    g.sc->Present(g.cfg.presentVsync ? 1 : 0, 0);
+    QueryPerformanceCounter(&t2);
+    gPerf.rendered++;
+    gPerf.renderCpuMs += double(t1.QuadPart - t0.QuadPart) * 1000.0 / f.QuadPart;
+    gPerf.presentMs += double(t2.QuadPart - t1.QuadPart) * 1000.0 / f.QuadPart;
+    double presentCall = double(t2.QuadPart - t1.QuadPart) * 1000.0 / f.QuadPart;
+    if (g.cfg.perfDebug && presentCall > 4.0 && gPerf.spikes++ < 5)
+        Log(L"spike: Present blocked %.1f ms (previous overlay frame still queued on the GPU)", presentCall);
+    PerfTick();
     g.dirty = false;
-    if (!g.visible)
+    if (!g.visible && g.cfg.debugMode != 2) // 2 = pacing test: capture only, overlay hidden
     {
         ShowWindow(g.overlay, SW_SHOWNOACTIVATE);
         g.visible = true;
@@ -806,60 +1273,247 @@ void ReloadAll()
     if (g.dev)
         g.renderer.Reload();
     RegisterMenuKey();
+    ApplyGpuPriority();
     UpdateTrayTip();
     ShowOsd();
 }
 
-// Toggles menu: every switch in one place, current state checked. Opened by
-// the menu key (Insert by default) at the centre of the screen, or from the
-// tray icon at the cursor.
-void ShowToggleMenu(bool atCursor)
+// ---- Menu contents. Rebuilt on every draw, so states are always current.
+
+std::wstring ResolutionLabel()
 {
-    auto Flag = [](bool on) { return UINT(MF_STRING | (on ? MF_CHECKED : 0)); };
-    HMENU m = CreatePopupMenu();
+    if (g.resMode == 2)
+        return L"Native 4K";
+    if (g.resMode == 1)
+        return std::to_wstring(g.manualW) + L" \x00D7 " + std::to_wstring(g.manualH);
+    if (AutoResOn() && g.autoH > 0)
+        return L"Auto: " + std::to_wstring(g.autoW) + L" \x00D7 " + std::to_wstring(g.autoH);
+    return AutoResOn() ? L"From look + auto" : L"From look";
+}
 
-    HMENU looks = CreatePopupMenu();
-    for (size_t i = 0; i < g.cfg.presets.size(); i++)
-        AppendMenuW(looks, Flag(int(i) == g.cfg.presetIndex), ID_PRESET0 + i, g.cfg.presets[i].name.c_str());
-    HMENU beams = CreatePopupMenu();
-    for (int i = 0; i < int(_countof(kBeamLevels)); i++)
-        AppendMenuW(beams, Flag(i == g.beamLevel), ID_BEAM0 + i, kBeamLevels[i].name);
-    HMENU layouts = CreatePopupMenu();
-    for (int i = 0; i < int(_countof(kLayouts)); i++)
+std::vector<MenuItem> AspectList(const std::vector<std::pair<int, int>>& sizes, float aspect)
+{
+    std::vector<MenuItem> v;
+    for (auto [w, h] : sizes)
     {
-        std::wstring name = std::to_wstring(i) + L": " + kLayouts[i].name;
-        AppendMenuW(layouts, Flag(i == CurrentLayout()), ID_LAYOUT0 + i, name.c_str());
+        MenuItem it;
+        it.label = std::to_wstring(w) + L" \x00D7 " + std::to_wstring(h);
+        it.kind = MenuItem::Choice;
+        it.on = g.resMode == 1 && g.manualW == w && g.manualH == h;
+        it.run = [w, h, aspect] {
+            g.resMode = 1;
+            g.manualW = w;
+            g.manualH = h;
+            g.manualAspect = aspect;
+            g.dirty = true;
+        };
+        v.push_back(it);
     }
+    return v;
+}
 
-    AppendMenuW(m, Flag(g.enabled), ID_ENABLE, L"Phosphor on\tCtrl+Alt+Shift+C");
-    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(m, MF_POPUP, (UINT_PTR)looks, L"Look\tCtrl+Alt+Shift+P");
-    AppendMenuW(m, MF_POPUP, (UINT_PTR)beams, L"Beam sharpness\tCtrl+Alt+Shift+B");
-    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(m, Flag(AutoResOn()), ID_AUTORES, L"Auto resolution detection\tCtrl+Alt+Shift+A");
-    AppendMenuW(m, Flag(MotionOn()), ID_MOTION, L"CRT motion (experimental)\tCtrl+Alt+Shift+M");
-    AppendMenuW(m, Flag(g.split > 0), ID_SPLIT, L"Split compare (raw | Phosphor)\tCtrl+Alt+Shift+S");
-    AppendMenuW(m, Flag(!g.characterOff), ID_CHARACTER, L"Glass veil + analog softness\tCtrl+Alt+Shift+G");
-    AppendMenuW(m, MF_POPUP, (UINT_PTR)layouts, L"Colour fringe fix\tCtrl+Alt+Shift+L");
-    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(m, MF_STRING, ID_OPENCFG, L"Edit config...");
-    AppendMenuW(m, MF_STRING, ID_RELOAD, L"Reload config + shader\tCtrl+Alt+Shift+R");
-    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(m, MF_STRING, ID_EXIT, L"Quit Phosphor\tCtrl+Alt+Shift+Q");
-
-    POINT pt;
-    UINT align = TPM_RIGHTBUTTON;
-    if (atCursor)
-        GetCursorPos(&pt);
-    else
+std::vector<MenuItem> ResolutionMenu()
+{
+    std::vector<MenuItem> v;
+    MenuItem look{L"From look (default)", MenuItem::Choice, g.resMode == 0, [] {
+                      g.resMode = 0;
+                      g.dirty = true;
+                  }};
+    look.value = L"each look decides";
+    v.push_back(look);
+    v.push_back({L"Native 4K (never resample)", MenuItem::Choice, g.resMode == 2, [] {
+                     g.resMode = 2;
+                     g.dirty = true;
+                 }});
+    v.push_back({L"Auto detect stretched content", MenuItem::Toggle, AutoResOn(), [] {
+                     g.autoRes = AutoResOn() ? 0 : 1;
+                     if (!g.autoRes)
+                         g.autoW = g.autoH = 0;
+                     g.dirty = true;
+                 }});
+    struct Tab
     {
-        pt = {(g.disp.rect.left + g.disp.rect.right) / 2, (g.disp.rect.top + g.disp.rect.bottom) / 2};
-        align |= TPM_CENTERALIGN | TPM_VCENTERALIGN;
+        const wchar_t* name;
+        std::vector<std::pair<int, int>> sizes;
+        float aspect; // displayed aspect for non-square pixels, 0 = square
+    };
+    // The largest entry of each aspect is the biggest that fits a 3840x2160 panel.
+    static const Tab tabs[] = {
+        {L"16:9", {{3200, 1800}, {2560, 1440}, {1920, 1080}, {1600, 900}, {1366, 768}, {1280, 720}, {1024, 576}, {960, 540}, {854, 480}, {640, 360}, {426, 240}}, 0},
+        {L"16:10", {{3456, 2160}, {2560, 1600}, {1920, 1200}, {1680, 1050}, {1440, 900}, {1280, 800}, {1024, 640}, {640, 400}, {320, 200}}, 0},
+        {L"4:3", {{2880, 2160}, {2048, 1536}, {1600, 1200}, {1440, 1080}, {1280, 960}, {1024, 768}, {800, 600}, {640, 480}, {512, 384}, {320, 240}}, 0},
+        {L"5:4", {{2700, 2160}, {1280, 1024}, {640, 512}}, 0},
+        {L"21:9", {{3840, 1646}, {3440, 1440}, {2560, 1080}, {1720, 720}}, 0},
+        {L"Retro consoles (shown 4:3)", {{640, 480}, {640, 448}, {512, 448}, {384, 224}, {320, 240}, {320, 224}, {256, 240}, {256, 224}}, 4.0f / 3.0f},
+    };
+    for (const Tab& t : tabs)
+    {
+        MenuItem sub{t.name, MenuItem::Submenu};
+        for (auto [w, h] : t.sizes)
+            if (g.resMode == 1 && g.manualW == w && g.manualH == h)
+                sub.value = std::to_wstring(w) + L" \x00D7 " + std::to_wstring(h);
+        const Tab* tab = &t;
+        sub.items = [tab] { return AspectList(tab->sizes, tab->aspect); };
+        v.push_back(sub);
     }
-    SetForegroundWindow(g.ctrl);
-    TrackPopupMenu(m, align, pt.x, pt.y, 0, g.ctrl, nullptr);
-    PostMessageW(g.ctrl, WM_NULL, 0, 0);
-    DestroyMenu(m); // also destroys the submenus
+    return v;
+}
+
+std::vector<MenuItem> RootMenu()
+{
+    std::vector<MenuItem> v;
+    v.push_back({L"Phosphor", MenuItem::Toggle, g.enabled, [] { SetEnabled(!g.enabled); }});
+
+    MenuItem looks{L"Look", MenuItem::Submenu};
+    looks.value = g.cfg.presets[g.cfg.presetIndex].name;
+    looks.items = [] {
+        std::vector<MenuItem> l;
+        for (size_t i = 0; i < g.cfg.presets.size(); i++)
+            l.push_back({g.cfg.presets[i].name, MenuItem::Choice, int(i) == g.cfg.presetIndex,
+                         [i] { NextPreset(int(i)); }});
+        return l;
+    };
+    v.push_back(looks);
+
+    MenuItem res{L"Resolution", MenuItem::Submenu};
+    res.value = ResolutionLabel();
+    res.items = ResolutionMenu;
+    v.push_back(res);
+
+    MenuItem beam{L"Beam sharpness", MenuItem::Submenu};
+    beam.value = kBeamLevels[g.beamLevel].name;
+    beam.items = [] {
+        std::vector<MenuItem> l;
+        for (int i = 0; i < int(_countof(kBeamLevels)); i++)
+            l.push_back({kBeamLevels[i].name, MenuItem::Choice, i == g.beamLevel, [i] {
+                             g.beamLevel = i;
+                             g.dirty = true;
+                         }});
+        return l;
+    };
+    v.push_back(beam);
+
+    v.push_back({L"Split compare (raw | Phosphor)", MenuItem::Toggle, g.split > 0, [] {
+                     g.split = g.split > 0 ? 0.0f : 0.5f;
+                     g.dirty = true;
+                 }});
+    v.push_back({L"CRT motion (experimental)", MenuItem::Toggle, MotionOn(), [] {
+                     g.motion = MotionOn() ? 0 : 1;
+                     g.lastField = -1;
+                     ApplyGpuPriority();
+                     g.dirty = true;
+                 }});
+    v.push_back({L"Glass veil + analog softness", MenuItem::Toggle, !g.characterOff, [] {
+                     g.characterOff = !g.characterOff;
+                     g.dirty = true;
+                 }});
+
+    MenuItem fringe{L"Colour fringe fix", MenuItem::Submenu};
+    fringe.value = std::to_wstring(CurrentLayout());
+    fringe.items = [] {
+        std::vector<MenuItem> l;
+        for (int i = 0; i < int(_countof(kLayouts)); i++)
+            l.push_back({std::to_wstring(i) + L": " + kLayouts[i].name, MenuItem::Choice, i == CurrentLayout(), [i] {
+                             g.layout = i;
+                             g.dirty = true;
+                         }});
+        return l;
+    };
+    v.push_back(fringe);
+
+    v.push_back({L"Edit config\x2026", MenuItem::Action, false,
+                 [] { ShellExecuteW(nullptr, L"open", L"notepad.exe", g.cfgPath.c_str(), nullptr, SW_SHOWNORMAL); }});
+    v.push_back({L"Reload config + shader", MenuItem::Action, false, [] { ReloadAll(); }});
+    v.push_back({L"Quit Phosphor", MenuItem::Action, false, [] { g.running = false; }});
+    return v;
+}
+
+// Navigation keys are only claimed while the menu is open.
+void SetMenuKeys(bool on)
+{
+    struct K
+    {
+        int id;
+        UINT vk;
+        bool repeat;
+    };
+    static const K keys[] = {{HK_NAV_UP, VK_UP, true},         {HK_NAV_DOWN, VK_DOWN, true},
+                             {HK_NAV_LEFT, VK_LEFT, false},    {HK_NAV_RIGHT, VK_RIGHT, false},
+                             {HK_NAV_ENTER, VK_RETURN, false}, {HK_NAV_BACK, VK_BACK, false},
+                             {HK_NAV_ESC, VK_ESCAPE, false}};
+    for (const K& k : keys)
+        if (on)
+            RegisterHotKey(g.ctrl, k.id, k.repeat ? 0 : MOD_NOREPEAT, k.vk);
+        else
+            UnregisterHotKey(g.ctrl, k.id);
+}
+
+void CloseMenu()
+{
+    if (!gMenu.open)
+        return;
+    gMenu.open = false;
+    gMenu.stack.clear();
+    SetMenuKeys(false);
+    RebuildOsd();
+    g.dirty = true;
+}
+
+void OpenMenu()
+{
+    if (!g.enabled)
+        SetEnabled(true); // the menu lives in the overlay
+    gMenu.open = true;
+    gMenu.stack = {{L"Phosphor", RootMenu, 0}};
+    gMenu.lastInput = GetTickCount();
+    SetMenuKeys(true);
+    RebuildOsd();
+    g.dirty = true;
+}
+
+void MenuKey(int key)
+{
+    if (!gMenu.open || gMenu.stack.empty())
+        return;
+    gMenu.lastInput = GetTickCount();
+    MenuLevel& lv = gMenu.stack.back();
+    std::vector<MenuItem> items = lv.items();
+    int n = int(items.size());
+    if (key == HK_NAV_UP && n)
+        lv.sel = (lv.sel + n - 1) % n;
+    else if (key == HK_NAV_DOWN && n)
+        lv.sel = (lv.sel + 1) % n;
+    else if (key == HK_NAV_ESC)
+        return CloseMenu();
+    else if (key == HK_NAV_LEFT || key == HK_NAV_BACK)
+    {
+        if (gMenu.stack.size() > 1)
+            gMenu.stack.pop_back();
+        else
+            return CloseMenu();
+    }
+    else if ((key == HK_NAV_RIGHT || key == HK_NAV_ENTER) && lv.sel < n)
+    {
+        MenuItem it = items[lv.sel];
+        if (it.kind == MenuItem::Submenu)
+        {
+            // Open with the current choice selected, if there is one.
+            std::vector<MenuItem> sub = it.items();
+            int sel = 0;
+            for (int i = 0; i < int(sub.size()); i++)
+                if (sub[i].on && sub[i].kind == MenuItem::Choice)
+                    sel = i;
+            gMenu.stack.push_back({it.label, it.items, sel});
+        }
+        else if (key == HK_NAV_ENTER && it.run)
+        {
+            it.run();
+            if (!g.enabled || !g.running)
+                return CloseMenu();
+        }
+    }
+    RebuildOsd();
+    g.dirty = true;
 }
 
 UINT MenuVirtualKey(const std::wstring& name);
@@ -915,6 +1569,7 @@ void Command(UINT id)
     {
         g.motion = MotionOn() ? 0 : 1;
         g.lastField = -1;
+        ApplyGpuPriority();
         ShowOsd();
     }
     else if (id == ID_CHARACTER)
@@ -972,6 +1627,7 @@ LRESULT CALLBACK CtrlProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         case HK_MOTION:
             g.motion = MotionOn() ? 0 : 1;
             g.lastField = -1;
+            ApplyGpuPriority();
             Log(L"motion: %s, K=%d, refresh %.3f ms", g.motion ? L"on" : L"off", MotionK(), g.refreshMs);
             ShowOsd();
             break;
@@ -985,7 +1641,19 @@ LRESULT CALLBACK CtrlProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             g.dirty = true;
             break;
         case HK_MENU:
-            ShowToggleMenu(false);
+            if (gMenu.open)
+                CloseMenu();
+            else
+                OpenMenu();
+            break;
+        case HK_NAV_UP:
+        case HK_NAV_DOWN:
+        case HK_NAV_LEFT:
+        case HK_NAV_RIGHT:
+        case HK_NAV_ENTER:
+        case HK_NAV_BACK:
+        case HK_NAV_ESC:
+            MenuKey(int(wp));
             break;
         case HK_AUTORES:
             g.autoRes = AutoResOn() ? 0 : 1;
@@ -1014,7 +1682,10 @@ LRESULT CALLBACK CtrlProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     case WM_TRAY:
         if (LOWORD(lp) == WM_RBUTTONUP || LOWORD(lp) == WM_LBUTTONUP)
-            ShowToggleMenu(true);
+            if (gMenu.open)
+                CloseMenu();
+            else
+                OpenMenu();
         return 0;
     case WM_COMMAND:
         Command(LOWORD(wp));
@@ -1084,6 +1755,7 @@ int RunOverlay(HINSTANCE inst)
     Shell_NotifyIconW(NIM_ADD, &g.tray);
     UpdateTrayTip();
 
+    SetGpuSchedulingClass(g.cfg.gpuPriority ? 4 : 2);
     gDetector.Start();
     while (g.running)
     {
@@ -1099,6 +1771,8 @@ int RunOverlay(HINSTANCE inst)
             break;
 
         DWORD now = GetTickCount();
+        if (gMenu.open && now - gMenu.lastInput > 60000)
+            CloseMenu();
         if (g.osdInfo && now >= g.osdUntil)
         {
             RebuildOsd(); // info panel timed out; keep split labels if any
@@ -1118,6 +1792,14 @@ int RunOverlay(HINSTANCE inst)
                 ReloadAll();
         }
 
+        if (now - g.lastAppCheck > 300)
+        {
+            g.lastAppCheck = now;
+            CheckApp(); // also while paused, so a paused game can resume us
+            if (g.enabled && !g.needSetup && g.dup)
+                CheckGameWindow();
+        }
+
         if (!g.enabled || g.needSetup || !g.dup)
         {
             if (g.enabled && now - g.lastSetupTry > 1000)
@@ -1130,11 +1812,6 @@ int RunOverlay(HINSTANCE inst)
             continue;
         }
 
-        if (now - g.lastAppCheck > 300)
-        {
-            g.lastAppCheck = now;
-            CheckApp();
-        }
         // Resolution detection: probe the raw desktop twice a second while it
         // changes; the analysis runs on a worker thread.
         if (AutoResOn() && g.haveFrame && g.dev)
@@ -1168,32 +1845,64 @@ int RunOverlay(HINSTANCE inst)
         // Rolling scan presents every refresh (Present paces the loop), so it
         // only polls for new desktop frames; otherwise wait for one.
         bool motion = MotionOn();
-        DXGI_OUTDUPL_FRAME_INFO fi;
-        ComPtr<IDXGIResource> res;
-        HRESULT hr = g.dup->AcquireNextFrame(motion ? 0 : 8, &fi, &res);
-        if (FAILED(hr) && hr != DXGI_ERROR_WAIT_TIMEOUT)
+        if (g.wcap.Target())
         {
-            Log(L"AcquireNextFrame 0x%08x, reinitialising", hr);
-            g.needSetup = true;
-            continue;
-        }
-        if (SUCCEEDED(hr))
-        {
-            if (fi.LastPresentTime.QuadPart != 0 || !g.haveFrame)
+            ComPtr<ID3D11Texture2D> tex;
+            LONGLONG q = 0;
+            int skipped = 0;
+            bool got = g.wcap.Acquire(tex, q, skipped);
+            if (!got && !motion && g.wcap.Active())
             {
-                ComPtr<ID3D11Texture2D> tex;
-                if (SUCCEEDED(res.As(&tex)))
+                HANDLE e = g.wcap.Event();
+                MsgWaitForMultipleObjects(1, &e, FALSE, 8, QS_ALLINPUT);
+                got = g.wcap.Acquire(tex, q, skipped);
+            }
+            if (got)
+            {
+                D3D11_TEXTURE2D_DESC td;
+                tex->GetDesc(&td);
+                if (td.Width != g.w || td.Height != g.h)
                 {
-                    g.ctx->CopyResource(g.frame.Get(), tex.Get());
-                    g.haveFrame = true;
-                    g.dirty = true;
-                    g.newFrame = true;
-                    g.motionShown = true;
-                    g.framesSinceProbe = true;
-                    g.lastCaptureQpc = Qpc();
+                    Log(L"capture: game window is %ux%u, not the display's %ux%u; using the desktop", td.Width,
+                        td.Height, g.w, g.h);
+                    g.wcapFailed = g.wcap.Target();
+                    g.wcap.Stop();
+                }
+                else
+                {
+                    gPerf.superseded += skipped;
+                    TakeFrame(tex.Get());
                 }
             }
-            g.dup->ReleaseFrame();
+            else if (!g.wcap.Active())
+            {
+                Log(L"capture: game window closed, back to the desktop");
+                g.wcap.Stop();
+            }
+        }
+        else
+        {
+            DXGI_OUTDUPL_FRAME_INFO fi;
+            ComPtr<IDXGIResource> res;
+            HRESULT hr = g.dup->AcquireNextFrame(motion ? 0 : 8, &fi, &res);
+            if (FAILED(hr) && hr != DXGI_ERROR_WAIT_TIMEOUT)
+            {
+                Log(L"AcquireNextFrame 0x%08x, reinitialising", hr);
+                g.needSetup = true;
+                continue;
+            }
+            if (SUCCEEDED(hr))
+            {
+                if (fi.LastPresentTime.QuadPart != 0 || !g.haveFrame)
+                {
+                    ComPtr<ID3D11Texture2D> tex;
+                    if (SUCCEEDED(res.As(&tex)))
+                    {
+                        TakeFrame(tex.Get());
+                    }
+                }
+                g.dup->ReleaseFrame();
+            }
         }
         if (!g.haveFrame)
             continue;
@@ -1297,6 +2006,7 @@ int RunImage(const std::wstring& in, const std::wstring& out, const std::wstring
 
     FrameParams fp;
     fp.look = g.cfg.look();
+    fp.fastPath = g.cfg.fastPath;
     if (!source.empty())
     {
         size_t x = source.find(L'x');
@@ -1366,6 +2076,10 @@ int RunImage(const std::wstring& in, const std::wstring& out, const std::wstring
     }
     if (bench > 0)
     {
+        // Measure the pipeline, not the queue behind whatever else is running.
+        ComPtr<IDXGIDevice> dxgiDev;
+        if (SUCCEEDED(g.dev.As(&dxgiDev)))
+            dxgiDev->SetGPUThreadPriority(7);
         D3D11_QUERY_DESC qd{D3D11_QUERY_EVENT, 0};
         ComPtr<ID3D11Query> q;
         g.dev->CreateQuery(&qd, &q);
@@ -1381,8 +2095,13 @@ int RunImage(const std::wstring& in, const std::wstring& out, const std::wstring
         QueryPerformanceCounter(&t1);
         double ms = double(t1.QuadPart - t0.QuadPart) * 1000.0 / f.QuadPart / bench;
         Log(L"bench: %.3f ms/frame (%.0f fps max)", ms, 1000.0 / ms);
-        g.renderer.ProfileNext();
-        g.renderer.Render(src.Get(), rtv.Get(), w, h, fp);
+        // Per-pass timings from a hot GPU (queued behind the timed frames).
+        for (int i = 0; i < 30; i++)
+        {
+            if (i == 29)
+                g.renderer.ProfileNext();
+            g.renderer.Render(src.Get(), rtv.Get(), w, h, fp);
+        }
     }
     g.ctx->CopyResource(staging.Get(), dst.Get());
     D3D11_MAPPED_SUBRESOURCE m;
@@ -1440,6 +2159,14 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int)
             if (args[i] == L"--source") source = args[i + 1];
         }
         return RunImage(args[1], args[2], preset, widthMm, source, bench, layout, prevPath, deblur, vectors);
+    }
+    if (!args.empty() && args[0] == L"--stress")
+    {
+        // Fake heavy game for pacing tests: --stress [iterations] [seconds] [fps cap]
+        int iters = args.size() > 1 ? _wtoi(args[1].c_str()) : 60;
+        int secs = args.size() > 2 ? _wtoi(args[2].c_str()) : 30;
+        int cap = args.size() > 3 ? _wtoi(args[3].c_str()) : 0;
+        return RunStress(g.cfg.monitor, iters, secs, cap);
     }
     if (!args.empty() && args[0] == L"--list")
     {

@@ -55,8 +55,8 @@ cbuffer Frame : register(b0)
 
     float radiusH;       // gather radius in source columns
     float radiusV;       // gather radius in scanlines
-    float framePad1;
-    float framePad2;
+    float srcOffX;       // where the content's source grid starts on screen (px):
+    float srcOffY;       // non-zero for pillarboxed / letterboxed content
 
     float diffusion;     // energy fraction scattered short range
     float halation;      // energy fraction scattered by the faceplate
@@ -157,10 +157,27 @@ float3 Erf3(float3 x)
 
 // Box of half-width hw convolved with a gaussian, evaluated at d.
 // Sums to exactly 1 across a row of boxes: brightness is preserved.
+// Gaussian CDF as a smooth odd polynomial (max error 0.0017), reaching 0 and 1
+// at +-3 sigma with zero slope: a few multiply-adds, no exp.
+float3 Phi(float3 x)
+{
+    x = clamp(x, -3.0, 3.0);
+    float3 x2 = x * x;
+    return 0.5 + x * (0.3968262987 + x2 * (-0.06202805046 + x2 * (0.007276986876 + x2 * (-0.0004683397891 +
+                                                                                            x2 * 1.220493696e-05))));
+}
+
+// A box (one source pixel held for hw*2) blurred by the beam spot, at d.
+// Across a row of boxes the terms telescope (Phi(b) - Phi(a), then Phi(c) -
+// Phi(b), ...), so brightness is conserved exactly whatever CDF is used.
+float3 BoxGaussK(float3 d, float hw, float3 invSigma)
+{
+    return Phi((d + hw) * invSigma) - Phi((d - hw) * invSigma);
+}
+
 float3 BoxGauss(float3 d, float hw, float3 sigma)
 {
-    float3 k = 0.70710678 / sigma;
-    return 0.5 * (Erf3((d + hw) * k) - Erf3((d - hw) * k));
+    return BoxGaussK(d, hw, 1.0 / sigma);
 }
 
 // Spot core width per gun from its beam current.
@@ -200,21 +217,38 @@ float Hash(float2 p, float seed)
 
 // Desktop code value = tube drive voltage. The tube answers with a pure power
 // law (true black, no sRGB toe). HDR highlights above SDR white pass through.
+// Desktop code value = tube drive voltage -> what the tube emits (gamut applied).
+float3 DecodePixel(float3 raw)
+{
+    float3 crt;
+    if (inputMode < 0.5)
+        crt = pow(saturate(raw), crtGamma); // 8-bit desktop: the code value is the drive
+    else
+    {
+        // HDR desktop: re-encode to the code value, then the tube curve. Both
+        // steps are baked into a lookup table (T1, indexed by sqrt for precision
+        // near black); HDR highlights above SDR white pass through.
+        float3 lin = max(raw / sdrWhiteScale, 0);
+        float3 base = min(lin, 1.0);
+        float3 u = sqrt(base) * (1023.0 / 1024.0) + 0.5 / 1024.0;
+        crt = float3(T1.SampleLevel(Lin, float2(u.r, 0.5), 0).r, T1.SampleLevel(Lin, float2(u.g, 0.5), 0).r,
+                     T1.SampleLevel(Lin, float2(u.b, 0.5), 0).r) +
+              (lin - base);
+    }
+    return float3(dot(gamut0.xyz, crt), dot(gamut1.xyz, crt), dot(gamut2.xyz, crt));
+}
+
 float4 PS_Decode(VSOut i) : SV_Target
 {
-    float3 lin = max(DecodeRaw(T0.Load(int3(i.pos.xy, 0)).rgb), 0);
-    float3 base = min(lin, 1.0);
-    float3 crt = pow(LinearToSrgb(base), crtGamma) + (lin - base);
-    crt = float3(dot(gamut0.xyz, crt), dot(gamut1.xyz, crt), dot(gamut2.xyz, crt));
-    return float4(crt, 1);
+    return float4(DecodePixel(T0.Load(int3(i.pos.xy, 0)).rgb), 1);
 }
 
 // Area filter W x H -> srcW x srcH. Inverts the GPU's upscale of lower-res content.
 float4 PS_Resample(VSOut i) : SV_Target
 {
     float2 p = floor(i.pos.xy);
-    float x0 = p.x * pitchX, x1 = x0 + pitchX;
-    float y0 = p.y * pitchY, y1 = y0 + pitchY;
+    float x0 = srcOffX + p.x * pitchX, x1 = x0 + pitchX;
+    float y0 = srcOffY + p.y * pitchY, y1 = y0 + pitchY;
     int c0 = int(floor(x0)), c1 = min(int(ceil(x1)), int(srcSize.x));
     int r0 = int(floor(y0)), r1 = min(int(ceil(y1)), int(srcSize.y));
     float3 acc = 0;
@@ -238,7 +272,7 @@ float4 PS_BeamH(VSOut i) : SV_Target
 {
     int y = int(i.pos.y);
     float x = i.pos.x;
-    int jc = int(floor(x / pitchX));
+    int jc = int(floor((x - srcOffX) / pitchX));
     int R = int(radiusH);
     int w = int(srcSize.x);
     float3 acc = 0;
@@ -251,7 +285,7 @@ float4 PS_BeamH(VSOut i) : SV_Target
         float extra = aaX * aaX + veil0.z * veil0.z;
         if (extra > 0)
             sc = sqrt(sc * sc + extra);
-        float3 d = x + subX.xyz - (j + 0.5) * pitchX;
+        float3 d = x + subX.xyz - (srcOffX + (j + 0.5) * pitchX);
         acc += c * BoxGauss(d, 0.5 * pitchX, sc);
     }
     return float4(acc, 1);
@@ -263,7 +297,7 @@ float4 PS_BeamV(VSOut i) : SV_Target
 {
     int x = int(i.pos.x);
     float yc = i.pos.y;
-    int kc = int(floor(yc / pitchY));
+    int kc = int(floor((yc - srcOffY) / pitchY));
     int R = int(radiusV);
     int n = int(srcSize.y);
     float3 acc = 0;
@@ -273,7 +307,7 @@ float4 PS_BeamV(VSOut i) : SV_Target
         float3 sc = SpotSigma(c);
         if (aaY > 0)
             sc = sqrt(sc * sc + aaY * aaY);
-        float3 d = yc + subY.xyz - (k + 0.5) * pitchY;
+        float3 d = yc + subY.xyz - (srcOffY + (k + 0.5) * pitchY);
         acc += c * BoxGauss(d, 0.5, sc) * pitchY;
     }
     return float4(acc, 1);
@@ -366,13 +400,16 @@ float4 Encode(float3 c, float2 p)
     if (outputMode > 1.5)
     {
         // Windows quantises scRGB to 10-bit PQ for the panel: dither one PQ
-        // code step so dark gradients stay smooth after the tube curve.
+        // code step so dark gradients stay smooth after the tube curve. The
+        // step size in nits is a fit to the exact PQ curve (within ~10% from
+        // 0.1 to 1000 nits), far cheaper than converting to PQ and back.
         // Sign kept: scRGB goes negative for phosphor colours beyond sRGB.
         c = min(c, peak);
         float3 nits = abs(c) * sdrWhiteScale * 80.0;
+        float3 step = nits * (0.0085 + 0.011 * pow(max(nits, 1e-4), -0.35));
         // Fade out at true black so pixels that should be off stay off.
-        float3 pq = NitsToPq(nits) + n / 1023.0 * saturate(nits / 0.005);
-        return float4(sign(c) * PqToNits(pq) / 80.0, 1);
+        nits = max(nits + n * step * saturate(nits / 0.005), 0.0);
+        return float4(sign(c) * nits / 80.0, 1);
     }
     float3 v = outputMode < 0.5 ? LinearToSrgb(saturate(c)) : pow(saturate(c), 1.0 / 2.2);
     v += n / (exp2(outputBits) - 1.0);
@@ -385,9 +422,10 @@ float4 PS_Final(VSOut i) : SV_Target
 {
     int2 p = int2(i.pos.xy);
     float3 beam = T0.Load(int3(p, 0)).rgb;
-    float3 skirt = lerp(Tent(T6, i.uv), Tent(T7, i.uv), tailMix);
+    // Fine glow levels are already smooth: plain bilinear is enough there.
+    float3 skirt = lerp(T6.Sample(Lin, i.uv).rgb, T7.Sample(Lin, i.uv).rgb, tailMix);
     beam = beam * (1.0 - spotTail) + skirt * spotTail;
-    float3 nearGlow = lerp(Tent(T1, i.uv), Tent(T2, i.uv), nearMix);
+    float3 nearGlow = lerp(T1.Sample(Lin, i.uv).rgb, T2.Sample(Lin, i.uv).rgb, nearMix);
     float3 haloGlow = Tent(T3, i.uv);
     // Glass veiling glow: light scattered very widely in the faceplate. A soft
     // atmospheric haze around bright areas; energy neutral like the others.
@@ -695,3 +733,72 @@ float4 PS_ProbeLines(VSOut i) : SV_Target
     float g = inputMode < 0.5 ? raw.g : LinearToSrgb(max(raw / sdrWhiteScale, 0.0)).g;
     return float4(g, 0, 0, 1);
 }
+
+// ---------------------------------------------------------------- fused beam
+// Native resolution (one panel row per scanline) is the common case: decode,
+// horizontal beam and vertical beam run in one compute pass. Each 16x16 tile
+// loads its pixels (plus an apron) once into on-chip memory, so the two
+// full-screen intermediates of the pixel-shader path are never written.
+// Same maths as PS_Decode + PS_BeamH + PS_BeamV with pitch 1 and no offset.
+#ifdef PHOSPHOR_CS
+#define TILE 16 // tile width
+#ifndef TILEY
+#define TILEY 16
+#endif
+#ifndef MAXR
+#define MAXR 3 // gather radius the apron covers (set per variant by the renderer)
+#endif
+#define APRON (TILE + 2 * MAXR)
+#define APRONY (TILEY + 2 * MAXR)
+groupshared float3 sDec[APRONY][APRON];
+groupshared float3 sDecK[APRONY][APRON]; // 1 / horizontal spot sigma, per source pixel
+groupshared float3 sH[APRONY][TILE];
+groupshared float3 sHK[APRONY][TILE];    // 1 / vertical spot sigma, per scanline sample
+RWTexture2D<float4> OutBeam : register(u0);
+
+[numthreads(TILE, TILEY, 1)]
+void CS_BeamNative(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID)
+{
+    int2 origin = int2(gid.xy) * int2(TILE, TILEY);
+    int2 base = origin - MAXR;
+    int2 size = int2(fullW, fullH);
+    int lane = int(tid.y) * TILE + int(tid.x);
+    float extra = veil0.z * veil0.z; // analog softness, horizontal only
+
+    // Decode the tile + apron once; each pixel's spot width is computed once too.
+    [loop] for (int i = lane; i < APRONY * APRON; i += TILE * TILEY)
+    {
+        int2 q = base + int2(i % APRON, i / APRON);
+        float3 c = 0;
+        if (all(q >= 0) && all(q < size))
+            c = max(DecodePixel(T0.Load(int3(q, 0)).rgb), 0);
+        float3 sc = SpotSigma(c) * spotAspect;
+        sDec[i / APRON][i % APRON] = c;
+        sDecK[i / APRON][i % APRON] = rsqrt(sc * sc + extra);
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    int rh = int(radiusH), rv = int(radiusV);
+    [loop] for (int k = lane; k < APRONY * TILE; k += TILE * TILEY)
+    {
+        int row = k / TILE, col = k % TILE;
+        float3 acc = 0;
+        [loop] for (int dx = -rh; dx <= rh; dx++)
+            acc += sDec[row][col + MAXR + dx] * BoxGaussK(subX.xyz - dx, 0.5, sDecK[row][col + MAXR + dx]);
+        sH[row][col] = acc;
+        sHK[row][col] = 1.0 / SpotSigma(acc);
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    int2 o = origin + int2(tid.xy);
+    if (any(o >= size))
+        return;
+    float3 acc = 0;
+    [loop] for (int dy = -rv; dy <= rv; dy++)
+    {
+        int r = int(tid.y) + MAXR + dy;
+        acc += sH[r][tid.x] * BoxGaussK(subY.xyz - dy, 0.5, sHK[r][tid.x]);
+    }
+    OutBeam[o] = float4(acc, 1);
+}
+#endif // PHOSPHOR_CS
