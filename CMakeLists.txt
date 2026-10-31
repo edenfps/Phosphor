@@ -23,6 +23,9 @@ add_custom_command(TARGET phosphor POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_SOURCE_DIR}/bin
     COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:phosphor> ${CMAKE_SOURCE_DIR}/bin/phosphor.exe)
 if(MSVC)
-    target_compile_options(phosphor PRIVATE /W3 /utf-8 /permissive-)
+    # /d1trimfile: no build-machine paths in __FILE__ strings.
+    target_compile_options(phosphor PRIVATE /W3 /utf-8 /permissive- "/d1trimfile:${CMAKE_SOURCE_DIR}/")
+    # PDB referenced by file name only, not by its full build path.
+    target_link_options(phosphor PRIVATE /PDBALTPATH:phosphor.pdb)
     set_property(TARGET phosphor PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()

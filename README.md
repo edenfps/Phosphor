@@ -58,14 +58,33 @@ errors, convergence errors and dimming are left out.
 Flicker, geometry and pincushion distortion, convergence errors, corner defocus, purity and moiré,
 ABL dimming of bright scenes, phosphor smear, noise, glass reflections, and damper wires.
 
+## Download
+
+Get the latest zip from [Releases](../../releases), extract it anywhere, and run `phosphor.exe`. It
+lives in the tray; press **Insert** for the menu. Keep `phosphor.ini` and the `shaders` folder next to
+the exe: edit them while it runs and changes apply on save.
+
 ## Requirements
 
 - Windows 10 2004 or newer (Windows 11 recommended)
 - A Direct3D 11 GPU
-- Built for 4K, high refresh, HDR-capable OLED panels, but works on any monitor
-- Visual Studio 2022/2026 with C++ tools, and CMake 3.20+, to build
+- Built for 4K, high refresh OLED panels, but works on any monitor
+
+## Tested on
+
+| | |
+|---|---|
+| Monitor | 32" QD-OLED, 3840×2160, 240 Hz, SDR and HDR |
+| GPU | NVIDIA RTX 3080 |
+| OS | Windows 11 |
+
+Other QD-OLEDs should work the same: sizes come from the monitor's EDID. If white text on black shows
+coloured edges, cycle the subpixel layout with **Ctrl+Alt+Shift+L** (`subpixel_layout = 0` turns the
+fix off for LCD and WOLED panels). AMD and Intel GPUs haven't been tested yet; reports welcome.
 
 ## Build
+
+Needs Visual Studio 2022/2026 with C++ tools and CMake 3.20+.
 
 ```bash
 cmake -S . -B build -A x64
@@ -77,8 +96,9 @@ folder, so you can edit them live while it runs.
 
 ## Setup
 
-1. **Turn on Windows HDR** and run the *Windows HDR Calibration* app. Set *SDR content brightness* so white
-   matches your taste (a CRT is about 100–150 nits). HDR gives Phosphor the headroom for highlight punch.
+1. **Optional: Windows HDR.** It lets small highlights go brighter than white, like a real tube. Run
+   the *Windows HDR Calibration* app and set *SDR content brightness* to taste (a CRT is about 100–150
+   nits). SDR works fully otherwise.
 2. **Monitor colour mode:** sRGB, or let Windows HDR handle colour. Wide-gamut modes like Display P3
    oversaturate everything.
 3. **Turn ClearType off** (grayscale text smoothing). A CRT has no subpixels.

@@ -1,4 +1,6 @@
 #include "wgc.h"
+// No source file paths compiled into error reporting.
+#define WINRT_NO_SOURCE_LOCATION
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Graphics.Capture.h>
 #include <winrt/Windows.Graphics.DirectX.Direct3D11.h>
